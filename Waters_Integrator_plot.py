@@ -5,12 +5,15 @@ import os
 import sys
 import re
 import csv
+import math
+import fnmatch
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import List
+from typing import List, Optional
 
 import pandas as pd
-import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 from rainbow.waters import masslynx
 
 # ---------------------------
@@ -22,6 +25,18 @@ def sanitize_filename(name: str, default: str = "sample") -> str:
     name = re.sub(r'[\\/*?:"<>|]+', "_", name.strip())
     name = name.strip(" .")
     return name or default
+
+
+def sanitize_folder_path(path: str, default: str = "group") -> str:
+    """Sanitize each folder component while retaining recursive separators."""
+    parts = []
+    for part in re.split(r"(?!\\\d+|\\g<.+>)[\\/]+", path.strip()):
+        if part in {"", ".", ".."}:
+            continue
+        safe_part = sanitize_filename(part, default="")
+        if safe_part:
+            parts.append(safe_part)
+    return os.path.join(*parts) if parts else default
 
 
 def find_rt_column(pdf: pd.DataFrame) -> str:
@@ -51,6 +66,65 @@ def parse_wavelength_label(col_name: str) -> str:
         except Exception:
             pass
     return re.sub(r"[^0-9A-Za-z]+", "_", col_name) or "wl"
+
+
+def parse_merge_wavelengths(value: str) -> List[str]:
+    """Parse a comma-separated wavelength selection into normalized labels."""
+    wavelengths = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            wavelength = float(item)
+        except ValueError as exc:
+            raise ValueError(f"Invalid wavelength: {item}") from exc
+        if not math.isfinite(wavelength) or wavelength <= 0:
+            raise ValueError(f"Invalid wavelength: {item}")
+        label = str(int(round(wavelength)))
+        if label not in wavelengths:
+            wavelengths.append(label)
+    return wavelengths
+
+
+def parse_group_rules(value: str, match_mode: str) -> List[tuple]:
+    """Parse ordered pattern => subfolder rules; regex folders allow match.expand references."""
+    rules = []
+    for line_number, line in enumerate(value.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        if "=>" not in line:
+            raise ValueError(f"Rule on line {line_number} must use pattern => subfolder.")
+        pattern, folder = (part.strip() for part in line.split("=>", 1))
+        if not pattern or not folder:
+            raise ValueError(f"Rule on line {line_number} needs both a pattern and a subfolder.")
+        if match_mode == "Regex":
+            try:
+                re.compile(pattern, re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"Invalid regex on line {line_number}: {exc}") from exc
+        rules.append((pattern, folder))
+    return rules
+
+
+def match_group(raw_name: str, rules: List[tuple], match_mode: str) -> Optional[str]:
+    """Return the destination from the first matching rule, if any."""
+    for pattern, folder in rules:
+        if match_mode == "Regex":
+            match = re.search(pattern, raw_name, re.IGNORECASE)
+            if match is None:
+                continue
+            try:
+                folder = match.expand(folder)
+            except re.error as exc:
+                raise ValueError(f"Invalid group reference in folder for pattern {pattern!r}: {exc}") from exc
+        else:
+            matches = fnmatch.fnmatchcase(raw_name.casefold(), pattern.casefold())
+            if not matches:
+                continue
+        return sanitize_folder_path(folder)
+    return None
 
 
 # ---------------------------
@@ -105,7 +179,13 @@ def process_func001(dat_path: str, base_name: str, mz_dir: str, tic_dir: str, pr
     tic_df.to_csv(tic_csv, index=False)
 
 
-def process_func002(dat_path: str, base_name: str, chrom_dir: str, prec: int = 0):
+def process_func002(
+    dat_path: str,
+    base_name: str,
+    chrom_dir: str,
+    prec: int = 0,
+    merge_wavelengths: Optional[List[str]] = None,
+):
     """
     Process _FUNC002.DAT (spectral UV-Vis):
       - First column is 'RT (min)', remaining columns are wavelengths (nm).
@@ -131,9 +211,14 @@ def process_func002(dat_path: str, base_name: str, chrom_dir: str, prec: int = 0
 
     rt_col = find_rt_column(pdf)
     spec_cols = [c for c in pdf.columns if c != rt_col]
+    selected = set(merge_wavelengths or [])
+    merged_cols = {}
 
     for col in spec_cols:
         wl_suffix = parse_wavelength_label(col)
+        if wl_suffix in selected:
+            merged_cols[wl_suffix] = pdf[col]
+            continue
         out_csv = os.path.join(chrom_dir, f"{base_name}_{wl_suffix}_nm.csv")
         out_df = pd.DataFrame({
             rt_col: pdf[rt_col],
@@ -141,8 +226,24 @@ def process_func002(dat_path: str, base_name: str, chrom_dir: str, prec: int = 0
         })
         out_df.to_csv(out_csv, index=False)
 
+    available = [wl for wl in (merge_wavelengths or []) if wl in merged_cols]
+    if available:
+        merged_df = pd.DataFrame({rt_col: pdf[rt_col]})
+        for wl in available:
+            merged_df[f"{wl} nm"] = merged_cols[wl]
+        suffix = "_".join(merge_wavelengths or available)
+        merged_csv = os.path.join(chrom_dir, f"{base_name}_{suffix}_nm.csv")
+        merged_df.to_csv(merged_csv, index=False)
 
-def extract_masslynx_folder(root: str, status_cb=None, prec: int = 0) -> str:
+
+def extract_masslynx_folder(
+    root: str,
+    status_cb=None,
+    prec: int = 0,
+    merge_wavelengths: Optional[List[str]] = None,
+    group_rules: Optional[List[tuple]] = None,
+    match_mode: str = "Regex",
+) -> str:
     """
     Extract MassLynx .raw folders beneath 'root' into:
         <root>/csvs/chrom  (chromatographic *_nm.csv)
@@ -162,6 +263,8 @@ def extract_masslynx_folder(root: str, status_cb=None, prec: int = 0) -> str:
     os.makedirs(tic_dir, exist_ok=True)
 
     raw_dirs = iter_raw_dirs(root)
+    for raw_dir in raw_dirs:
+        match_group(os.path.basename(raw_dir), group_rules or [], match_mode)
 
     if status_cb:
         status_cb(f"Found {len(raw_dirs)} .raw folder(s).")
@@ -188,10 +291,20 @@ def extract_masslynx_folder(root: str, status_cb=None, prec: int = 0) -> str:
                     func002 = os.path.join(raw_dir, fn)
 
         try:
+            group = match_group(base_raw, group_rules or [], match_mode)
+            sample_mz_dir = os.path.join(mz_dir, group) if group else mz_dir
+            sample_tic_dir = os.path.join(tic_dir, group) if group else tic_dir
+            sample_chrom_dir = os.path.join(chrom_dir, group) if group else chrom_dir
             if func001:
-                process_func001(func001, base_name, mz_dir, tic_dir, prec=prec)
+                process_func001(func001, base_name, sample_mz_dir, sample_tic_dir, prec=prec)
             if func002:
-                process_func002(func002, base_name, chrom_dir, prec=prec)
+                process_func002(
+                    func002,
+                    base_name,
+                    sample_chrom_dir,
+                    prec=prec,
+                    merge_wavelengths=merge_wavelengths,
+                )
             processed += 1
         except Exception:
             failed += 1
@@ -239,6 +352,65 @@ def read_chrom_csv(path: str):
         paired = sorted(zip(times, intens), key=lambda x: x[0])
         times, intens = map(list, zip(*paired))
     return times, intens
+
+
+def read_chrom_csv_channels(path: str):
+    """Read every signal column in a chromatogram CSV as a separate trace."""
+    channels = []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        rdr = csv.reader(f)
+        header = next(rdr, None)
+        if header is None or len(header) < 2:
+            return channels
+        try:
+            time_idx = header.index("retention_time_min")
+        except ValueError:
+            time_idx = 0
+        signal_indices = [idx for idx in range(len(header)) if idx != time_idx]
+        channel_data = {idx: ([], []) for idx in signal_indices}
+
+        for row in rdr:
+            if len(row) <= time_idx:
+                continue
+            try:
+                time = float(row[time_idx])
+            except (ValueError, IndexError):
+                continue
+            for idx in signal_indices:
+                if len(row) <= idx:
+                    continue
+                try:
+                    intensity = float(row[idx])
+                except ValueError:
+                    continue
+                channel_times, intensities = channel_data[idx]
+                channel_times.append(time)
+                intensities.append(intensity)
+
+        for idx in signal_indices:
+            channel_times, intensities = channel_data[idx]
+            if len(channel_times) > 1 and any(
+                channel_times[i] > channel_times[i + 1]
+                for i in range(len(channel_times) - 1)
+            ):
+                paired = sorted(zip(channel_times, intensities), key=lambda pair: pair[0])
+                channel_times, intensities = map(list, zip(*paired))
+            if channel_times:
+                channels.append((header[idx], channel_times, intensities))
+    return channels
+
+
+def find_chrom_csv_files(root: str) -> List[tuple]:
+    """Find chromatogram CSVs recursively, retaining subfolders in sample names."""
+    files = []
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            if filename.lower().endswith(".csv") and filename.lower() != "00_evaluated_data.csv":
+                path = os.path.join(dirpath, filename)
+                relative = os.path.relpath(path, root)
+                sample_name = os.path.splitext(relative)[0]
+                files.append((sample_name, path))
+    return sorted(files, key=lambda item: item[0].casefold())
 
 
 def moving_average(seq, window=5):
@@ -338,12 +510,15 @@ class GCApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MassLynx .raw — Extract & Integrate")
-        self.geometry("980x620")
-        self.minsize(960, 560)
+        self.geometry("980x760")
+        self.minsize(960, 670)
 
         # data models
         self.targets: List[tuple] = []  # (center_min, tol_minus_min, tol_plus_min)
         self.raw_root_var = tk.StringVar()
+        self.merge_wavelengths_var = tk.StringVar()
+        self.group_match_mode_var = tk.StringVar(value="Regex")
+        self.preview_summary_var = tk.StringVar(value="Select a root folder, then preview samples.")
         self.csv_folder_var = tk.StringVar()
         self.center_var = tk.StringVar()
         self.tol_minus_var = tk.StringVar()
@@ -353,6 +528,11 @@ class GCApp(tk.Tk):
         # plotting tool vars
         self.plot_folder_var = tk.StringVar()
         self.plot_file_var = tk.StringVar()
+        self.plot_dataset_var = tk.StringVar()
+        self.plot_all_datasets_var = tk.BooleanVar(value=False)
+        self.plot_status_var = tk.StringVar(value="Choose a folder to preview chromatograms.")
+        self.plot_paths = {}
+        self.plot_dataframe = None
 
         self._build_ui()
 
@@ -374,6 +554,65 @@ class GCApp(tk.Tk):
         )
         ttk.Button(frm_extract, text="Extract", command=self.extract_clicked).grid(
             row=0, column=3, padx=(0, 6), pady=6
+        )
+        ttk.Label(frm_extract, text="Merge wavelengths (nm, comma-separated):").grid(
+            row=1, column=0, sticky="w", padx=(6, 6), pady=(0, 6)
+        )
+        ttk.Entry(frm_extract, textvariable=self.merge_wavelengths_var).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        ttk.Label(frm_extract, text="Folder rules (one per line: pattern => folder):").grid(
+            row=2, column=0, sticky="nw", padx=(6, 6), pady=(0, 6)
+        )
+        self.group_rules_text = tk.Text(frm_extract, height=3, width=36, wrap="none")
+        self.group_rules_text.grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        frm_match_mode = ttk.Frame(frm_extract)
+        frm_match_mode.grid(row=2, column=3, sticky="nw", padx=(0, 6), pady=(0, 6))
+        ttk.Radiobutton(
+            frm_match_mode,
+            text="Wildcard",
+            variable=self.group_match_mode_var,
+            value="Wildcard",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            frm_match_mode,
+            text="Regex",
+            variable=self.group_match_mode_var,
+            value="Regex",
+        ).grid(row=1, column=0, sticky="w")
+        ttk.Label(frm_match_mode, text=r"Folders: () | (?P<name>) => \1 | \g<name>").grid(
+            row=2, column=0, sticky="w"
+        )
+        ttk.Label(frm_match_mode, text=r"Nested folders: / or \\").grid(
+            row=3, column=0, sticky="w"
+        )
+        self.preview_tree = ttk.Treeview(
+            frm_extract,
+            columns=("sample", "folder"),
+            show="headings",
+            height=5,
+        )
+        self.preview_tree.heading("sample", text="RAW sample")
+        self.preview_tree.heading("folder", text="Output subfolder")
+        self.preview_tree.column("sample", width=300, anchor="w")
+        self.preview_tree.column("folder", width=180, anchor="w")
+        self.preview_tree.grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        preview_scrollbar = ttk.Scrollbar(
+            frm_extract,
+            orient="vertical",
+            command=self.preview_tree.yview,
+        )
+        preview_scrollbar.grid(row=3, column=3, sticky="ns", padx=(0, 6), pady=(0, 6))
+        self.preview_tree.configure(yscrollcommand=preview_scrollbar.set)
+        ttk.Button(frm_extract, text="Preview", command=self.refresh_raw_preview).grid(
+            row=3, column=0, sticky="nw", padx=6, pady=(0, 6)
+        )
+        ttk.Label(frm_extract, textvariable=self.preview_summary_var).grid(
+            row=4, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6)
         )
 
         # ===== Integration: folder for CSVs =====
@@ -437,9 +676,10 @@ class GCApp(tk.Tk):
         )
 
         # ===== Plotting tool (BOTTOM) =====
-        frm_plot = ttk.LabelFrame(self, text="4) Quick CSV plot")
-        frm_plot.grid(row=4, column=0, columnspan=3, sticky="ew", padx=pad, pady=(0, pad))
+        frm_plot = ttk.LabelFrame(self, text="4) CSV chromatogram preview")
+        frm_plot.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=pad, pady=(0, pad))
         frm_plot.columnconfigure(1, weight=1)
+        frm_plot.rowconfigure(3, weight=1)
 
         ttk.Label(frm_plot, text="Folder:").grid(row=0, column=0, sticky="w", padx=(6, 6), pady=6)
         ent_plot_folder = ttk.Entry(frm_plot, textvariable=self.plot_folder_var)
@@ -451,15 +691,41 @@ class GCApp(tk.Tk):
         ttk.Label(frm_plot, text="CSV:").grid(row=1, column=0, sticky="w", padx=(6, 6), pady=6)
         self.plot_combo = ttk.Combobox(frm_plot, textvariable=self.plot_file_var, state="readonly")
         self.plot_combo.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=6)
-        ttk.Button(frm_plot, text="Plot", command=self.plot_csv_clicked).grid(
+        ttk.Button(frm_plot, text="Reload", command=self.load_plot_csv).grid(
             row=1, column=2, padx=(0, 6), pady=6
         )
+        ttk.Label(frm_plot, text="Signal:").grid(row=2, column=0, sticky="w", padx=(6, 6), pady=6)
+        self.plot_dataset_combo = ttk.Combobox(
+            frm_plot,
+            textvariable=self.plot_dataset_var,
+            state="readonly",
+        )
+        self.plot_dataset_combo.grid(row=2, column=1, sticky="ew", padx=(0, 6), pady=6)
+        ttk.Checkbutton(
+            frm_plot,
+            text="Show all signals",
+            variable=self.plot_all_datasets_var,
+            command=self.update_plot,
+        ).grid(row=2, column=2, sticky="w", padx=(0, 6), pady=6)
+
+        self.plot_figure = Figure(figsize=(8, 3.2), dpi=100, constrained_layout=True)
+        self.plot_axes = self.plot_figure.add_subplot(111)
+        self.plot_canvas = FigureCanvasTkAgg(self.plot_figure, master=frm_plot)
+        self.plot_canvas.get_tk_widget().grid(
+            row=3, column=0, columnspan=3, sticky="nsew", padx=6, pady=(0, 4)
+        )
+        ttk.Label(frm_plot, textvariable=self.plot_status_var).grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6)
+        )
+        self.plot_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_plot_csv())
+        self.plot_dataset_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_plot())
 
         # layout weights
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
         self.columnconfigure(2, weight=1)
         self.rowconfigure(2, weight=1)
+        self.rowconfigure(4, weight=1)
 
         # convenience
         self.listbox.bind("<Delete>", lambda e: self.delete_selected())
@@ -470,6 +736,38 @@ class GCApp(tk.Tk):
         folder = filedialog.askdirectory(title="Select root folder with .raw runs")
         if folder:
             self.raw_root_var.set(folder)
+            self.refresh_raw_preview()
+
+    def refresh_raw_preview(self):
+        root = self.raw_root_var.get().strip()
+        for item in self.preview_tree.get_children():
+            self.preview_tree.delete(item)
+        if not root or not os.path.isdir(root):
+            self.preview_summary_var.set("Select a valid root folder to preview samples.")
+            return
+        try:
+            rules = parse_group_rules(
+                self.group_rules_text.get("1.0", tk.END),
+                self.group_match_mode_var.get(),
+            )
+        except ValueError as exc:
+            self.preview_summary_var.set(str(exc))
+            return
+
+        raw_dirs = sorted(iter_raw_dirs(root))
+        preview_rows = []
+        try:
+            for raw_dir in raw_dirs[:20]:
+                raw_name = os.path.basename(raw_dir)
+                group = match_group(raw_name, rules, self.group_match_mode_var.get())
+                preview_rows.append((raw_name, group or "(root)"))
+        except ValueError as exc:
+            self.preview_summary_var.set(str(exc))
+            return
+        for raw_name, group in preview_rows:
+            self.preview_tree.insert("", tk.END, values=(raw_name, group))
+        shown = min(len(raw_dirs), 20)
+        self.preview_summary_var.set(f"Found {len(raw_dirs)} RAW samples; showing {shown}.")
 
     def browse_csv_folder(self):
         folder = filedialog.askdirectory(title="Select folder containing chromatogram CSVs")
@@ -517,13 +815,29 @@ class GCApp(tk.Tk):
                 "Please select a valid root folder containing MassLynx .raw runs."
             )
             return
+        try:
+            merge_wavelengths = parse_merge_wavelengths(self.merge_wavelengths_var.get())
+        except ValueError as e:
+            messagebox.showerror("Invalid wavelength", str(e))
+            return
+        try:
+            group_rules = parse_group_rules(
+                self.group_rules_text.get("1.0", tk.END),
+                self.group_match_mode_var.get(),
+            )
+        except ValueError as e:
+            messagebox.showerror("Invalid folder rule", str(e))
+            return
         self.status_var.set("Extracting…")
         self.update_idletasks()
         try:
             chrom_dir = extract_masslynx_folder(
                 root,
                 status_cb=lambda s: self.status_var.set(s),
-                prec=0
+                prec=0,
+                merge_wavelengths=merge_wavelengths,
+                group_rules=group_rules,
+                match_mode=self.group_match_mode_var.get(),
             )
             self.csv_folder_var.set(chrom_dir)
             self.status_var.set(f"Extraction finished → {chrom_dir}")
@@ -546,8 +860,7 @@ class GCApp(tk.Tk):
             messagebox.showerror("No targets", "Add at least one target with time and tolerances.")
             return
 
-        files = [fn for fn in os.listdir(csv_folder) if fn.lower().endswith(".csv")]
-        files = [fn for fn in files if fn.lower() != "00_evaluated_data.csv"]
+        files = find_chrom_csv_files(csv_folder)
         if not files:
             messagebox.showwarning("No CSVs found", "No CSV files found in the selected folder.")
             return
@@ -558,29 +871,32 @@ class GCApp(tk.Tk):
         self.status_var.set("Integrating…")
         self.update_idletasks()
 
-        for i, fn in enumerate(sorted(files)):
-            fpath = os.path.join(csv_folder, fn)
+        for sample_name, fpath in files:
             try:
-                times, intens = read_chrom_csv(fpath)
-                if not times:
+                channels = read_chrom_csv_channels(fpath)
+                if not channels:
                     raise RuntimeError("Empty/invalid chromatogram")
-                areas = []
-                for center, tol_minus, tol_plus in self.targets:
-                    area = integrate_peak_asym(
-                        times, intens,
-                        center, tol_minus, tol_plus,
-                        smooth_win=5
-                    )
-                    areas.append(area)
-                row = {"Sample": os.path.splitext(fn)[0]}
-                for hdr, val in zip(headers[1:], areas):
-                    row[hdr] = f"{val:.6g}"
-                rows.append(row)
+                for channel_name, times, intens in channels:
+                    areas = []
+                    for center, tol_minus, tol_plus in self.targets:
+                        area = integrate_peak_asym(
+                            times, intens,
+                            center, tol_minus, tol_plus,
+                            smooth_win=5
+                        )
+                        areas.append(area)
+                    row_name = sample_name
+                    if len(channels) > 1:
+                        row_name = f"{sample_name}_{channel_name.replace(' ', '')}"
+                    row = {"Sample": row_name}
+                    for hdr, val in zip(headers[1:], areas):
+                        row[hdr] = f"{val:.6g}"
+                    rows.append(row)
                 processed += 1
                 self.status_var.set(f"Integrating… {processed}/{len(files)}")
                 self.update_idletasks()
             except Exception:
-                row = {"Sample": os.path.splitext(fn)[0]}
+                row = {"Sample": sample_name}
                 for hdr in headers[1:]:
                     row[hdr] = "0"
                 rows.append(row)
@@ -605,45 +921,96 @@ class GCApp(tk.Tk):
         if not folder:
             return
         self.plot_folder_var.set(folder)
+        self.refresh_plot_files()
 
-        files = sorted(
-            fn for fn in os.listdir(folder)
-            if fn.lower().endswith(".csv")
-        )
-        self.plot_combo["values"] = files
-        self.plot_file_var.set(files[0] if files else "")
-
-    def plot_csv_clicked(self):
+    def refresh_plot_files(self):
         folder = self.plot_folder_var.get().strip()
-        fn = self.plot_file_var.get().strip()
-
         if not folder or not os.path.isdir(folder):
-            messagebox.showerror("Invalid folder", "Please select a valid folder to plot from.")
-            return
-        if not fn:
-            messagebox.showerror("No file selected", "Please select a CSV file to plot.")
+            self.plot_paths = {}
+            self.plot_combo["values"] = []
+            self.plot_file_var.set("")
+            self.plot_status_var.set("Select a valid folder to preview chromatograms.")
             return
 
-        path = os.path.join(folder, fn)
+        files = find_chrom_csv_files(folder)
+        self.plot_paths = {f"{sample_name}.csv": path for sample_name, path in files}
+        choices = list(self.plot_paths)
+        self.plot_combo["values"] = choices
+        if not choices:
+            self.plot_file_var.set("")
+            self.plot_dataset_combo["values"] = []
+            self.plot_status_var.set("No chromatogram CSV files found in this folder.")
+            self.plot_dataframe = None
+            self.update_plot()
+            return
+
+        self.plot_file_var.set(choices[0])
+        self.load_plot_csv()
+
+    def load_plot_csv(self):
+        selected_file = self.plot_file_var.get().strip()
+        path = self.plot_paths.get(selected_file)
+        if not path:
+            self.plot_status_var.set("Choose a CSV file to preview.")
+            return
         try:
-            df = pd.read_csv(path)
+            self.plot_dataframe = pd.read_csv(path)
         except Exception as e:
-            messagebox.showerror("Read error", str(e))
+            self.plot_dataframe = None
+            self.plot_status_var.set(f"Could not read CSV: {e}")
+            self.update_plot()
             return
 
-        if df.shape[1] < 2:
-            messagebox.showerror("Invalid CSV", "CSV must contain at least two columns to plot.")
+        if self.plot_dataframe.empty or len(self.plot_dataframe.columns) < 2:
+            self.plot_status_var.set("CSV must contain a time column and at least one signal column.")
+            self.update_plot()
             return
 
-        # Plot first two columns (basis code behavior)
-        plt.figure()
-        plt.plot(df.iloc[:, 0], df.iloc[:, 1], linestyle='-', marker='')
-        plt.xlabel(str(df.columns[0]))
-        plt.ylabel(str(df.columns[1]))
-        plt.title(fn)
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
+        rt_col = find_rt_column(self.plot_dataframe)
+        signal_columns = [column for column in self.plot_dataframe.columns if column != rt_col]
+        self.plot_dataset_combo["values"] = signal_columns
+        if self.plot_dataset_var.get() not in signal_columns:
+            self.plot_dataset_var.set(signal_columns[0] if signal_columns else "")
+        self.update_plot()
+
+    def update_plot(self):
+        self.plot_axes.clear()
+        df = self.plot_dataframe
+        if df is None or df.empty or len(df.columns) < 2:
+            self.plot_axes.set_title("CSV chromatogram preview")
+            self.plot_canvas.draw_idle()
+            return
+
+        rt_col = find_rt_column(df)
+        signal_columns = [column for column in df.columns if column != rt_col]
+        if self.plot_all_datasets_var.get():
+            selected_columns = signal_columns
+        else:
+            selected = self.plot_dataset_var.get()
+            selected_columns = [selected] if selected in signal_columns else []
+
+        x_values = pd.to_numeric(df[rt_col], errors="coerce")
+        plotted = 0
+        for column in selected_columns:
+            y_values = pd.to_numeric(df[column], errors="coerce")
+            valid = x_values.notna() & y_values.notna()
+            if not valid.any():
+                continue
+            self.plot_axes.plot(x_values[valid], y_values[valid], label=str(column), linewidth=1.4)
+            plotted += 1
+
+        self.plot_axes.set_xlabel(str(rt_col))
+        self.plot_axes.set_ylabel("Signal")
+        self.plot_axes.set_title(self.plot_file_var.get())
+        self.plot_axes.grid(True, alpha=0.3)
+        if plotted > 1:
+            self.plot_axes.legend(loc="best")
+        if plotted == 0:
+            self.plot_status_var.set("No numeric signal data available to plot.")
+        else:
+            mode = "all signals" if self.plot_all_datasets_var.get() else str(selected_columns[0])
+            self.plot_status_var.set(f"Showing {mode} ({plotted} trace{'s' if plotted != 1 else ''}).")
+        self.plot_canvas.draw_idle()
 
 
 # ---------------------------

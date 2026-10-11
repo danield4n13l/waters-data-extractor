@@ -19,12 +19,20 @@ If you are the original author of the project and would like to be credited, ple
   - Recursively finds and parses Waters `.raw` folders.
   - **MS / TIC (`_FUNC001.DAT`)**: Extracts complete m/z matrices and computes Total Ion Chromatograms (TIC).
   - **UV-Vis Photodiode Array (`_FUNC002.DAT`)**: Extracts absorbance traces per discrete wavelength (e.g., 210 nm, 254 nm).
-- **Batch Peak Integration**:
+- **Wavelength Merging**:
+  - Specify comma-separated wavelengths (e.g., `210, 254`) to combine selected channels into unified multi-column CSV files (`<sample>_<wl1>_<wl2>_nm.csv`) alongside or in place of individual single-wavelength exports.
+- **Rule-Based Sample Grouping & Routing**:
+  - Organize extracted files into structured subfolders using pattern rules (`pattern => subfolder`).
+  - Supports **Wildcard** (glob) and **Regex** matching modes with capture group expansion (e.g., `\1` or `\g<name>`) and nested directory paths (`/` or `\`).
+  - Interactive sample preview table (`ttk.Treeview`) allows checking destination folder mappings before extraction.
+- **Multi-Channel & Recursive Peak Integration**:
   - Define custom peak retention times with **asymmetric tolerance windows** (`Tol −` and `Tol +`).
   - Automatic apex detection, moving-average smoothing, and linear baseline subtraction.
-  - Processes batches of chromatograms and exports aggregated peak areas to `00_evaluated_data.csv`.
-- **Integrated Chromatogram Viewer**:
-  - Quickly plot extracted chromatograms and spectra directly within the application using Matplotlib.
+  - Recursively processes CSVs across subfolders and evaluates multiple channels per sample (labeling individual rows e.g. `<sample>_<channel>`).
+  - Exports aggregated peak areas into `00_evaluated_data.csv`.
+- **Embedded Multi-Channel Chromatogram Preview**:
+  - Built-in Matplotlib canvas embedded directly into the application window.
+  - Preview single traces or check **Show all signals** to overlay multiple channels on a single plot with automatic legends and grid lines.
 - **Minimal Dependencies & Native GUI**:
   - Built on Tkinter with zero heavy desktop framework overhead.
 
@@ -41,9 +49,12 @@ When you extract a folder containing MassLynx runs, the application creates a st
 │   └── _FUNC002.DAT           # UV/Vis spectral data
 ├── Sample_02.raw/
 └── csvs/
-    ├── chrom/                 # Wavelength-specific chromatograms (e.g., Sample_01_254_nm.csv)
-    ├── mz/                    # Full m/z matrices (e.g., Sample_01_mz.csv)
-    ├── tic/                   # Total Ion Chromatograms (e.g., Sample_01_tic.csv)
+    ├── chrom/                 # Wavelength chromatograms (single or merged)
+    │   ├── Group_A/           # Subfolders generated via grouping rules
+    │   │   └── Sample_01_210_254_nm.csv
+    │   └── Sample_02_254_nm.csv
+    ├── mz/                    # Full m/z matrices (retains group subfolders)
+    ├── tic/                   # Total Ion Chromatograms (retains group subfolders)
     └── 00_evaluated_data.csv  # Output summary generated after integration
 ```
 
@@ -96,10 +107,16 @@ python Waters_Integrator_plot.py
 
 1. **Data Extraction (MassLynx `.raw` &rarr; CSVs)**:
    - Click **Browse…** in Section 1 to select the folder containing your `.raw` runs.
-   - Click **Extract**. The application will parse `_FUNC001.DAT` and `_FUNC002.DAT` files and create the `csvs/` directory.
+   - *(Optional)* **Merge wavelengths**: Enter comma-separated wavelengths in nm (e.g., `210, 254`) to merge those traces into multi-column CSV files.
+   - *(Optional)* **Folder rules**: Enter one rule per line using `pattern => subfolder`.
+     - Choose **Wildcard** (e.g., `*Control* => Controls`) or **Regex** (e.g., `^Batch(\d+)_(.*) => Batch_\1/\2`).
+     - Regex mode supports capture references (`\1`, `\g<name>`) and nested folders (`/` or `\`).
+     - Click **Preview** to inspect the mapping of RAW samples to destination folders.
+   - Click **Extract**. The application will parse `_FUNC001.DAT` and `_FUNC002.DAT` files and create the `csvs/` directory structure.
 
 2. **Integration Target Folder**:
-   - The CSV folder automatically populates with `<root>/csvs/chrom` after extraction, or you can select any folder with chromatogram CSVs.
+   - The CSV folder automatically populates with `<root>/csvs/chrom` after extraction, or you can select any folder containing chromatographic CSV files.
+   - Subdirectories within the selected folder are automatically discovered and processed recursively.
 
 3. **Define Peak Targets**:
    - Enter the expected peak **Retention time (min)**.
@@ -109,11 +126,13 @@ python Waters_Integrator_plot.py
 
 4. **Run Integration**:
    - Click **Integrate**.
-   - The tool iterates through all chromatograms, computes baseline-corrected peak areas via trapezoidal integration, and saves the results to `00_evaluated_data.csv`.
+   - The tool iterates through all chromatograms recursively, integrating each signal channel independently (multi-channel CSVs output separate rows for each channel e.g., `<sample>_<channel>`), and saves peak areas to `00_evaluated_data.csv`.
 
-5. **Quick CSV Plot**:
-   - In Section 4, select a folder and a CSV file from the dropdown.
-   - Click **Plot** to inspect the trace with interactive zoom and pan controls.
+5. **CSV Chromatogram Preview**:
+   - In Section 4, select a folder containing CSV files.
+   - Select a CSV file from the dropdown (subfolders are preserved in the list).
+   - Choose a specific trace from the **Signal** dropdown or check **Show all signals** to overlay all available traces on the embedded Matplotlib figure.
+   - Click **Reload** to refresh the current file and plot view.
 
 ---
 
