@@ -570,6 +570,7 @@ def integrate_peak_asym(times, intens, center, tol_minus, tol_plus, smooth_win=5
         if dt > 0:
             area += 0.5 * (y_corr[k] + y_corr[k + 1]) * dt
     return area
+
 class CollapsibleSection(QWidget):
     expandedChanged = Signal(object, bool)
 
@@ -1373,6 +1374,15 @@ class MassLynxWindow(QMainWindow):
         reload_button.setObjectName("secondaryButton")
         reload_button.clicked.connect(self.refresh_plot_files)
         controls_layout.addRow(reload_button)
+        export_button = QPushButton("Export plot")
+        export_button.clicked.connect(self.export_plot_clicked)
+        controls_layout.addRow(export_button)
+        self.plot_export_dpi = QSpinBox()
+        self.plot_export_dpi.setRange(72, 2400)
+        self.plot_export_dpi.setSingleStep(100)
+        self.plot_export_dpi.setValue(600)
+        self.plot_export_dpi.setSuffix(" dpi")
+        controls_layout.addRow("Export resolution", self.plot_export_dpi)
         self.plot_status_label = QLabel("Choose a folder to preview chromatograms.")
         self.plot_status_label.setWordWrap(True)
         controls_layout.addRow(self.plot_status_label)
@@ -1420,6 +1430,7 @@ class MassLynxWindow(QMainWindow):
             "QSplitter::handle:hover { background: palette(highlight); }"
         )
         section.body_layout.addWidget(splitter, 1)
+
     def browse_raw_root(self):
         folder = QFileDialog.getExistingDirectory(self, "Select root folder with .raw runs")
         if folder:
@@ -1535,72 +1546,51 @@ class MassLynxWindow(QMainWindow):
             self.update_integration_preview()
 
     def integrate_clicked(self):
-        folder = self.csv_folder_edit.text().strip()
-        if not folder or not os.path.isdir(folder):
-            QMessageBox.critical(self, "Invalid directory", "Please select a valid CSV folder first.")
+        csv_folder = self.csv_folder_edit.text().strip()
+        if not os.path.isdir(csv_folder):
+            QMessageBox.warning(self, "Invalid folder", "Select a valid chromatogram CSV folder.")
+            return
+        if not self.targets:
+            QMessageBox.warning(self, "No targets", "Add at least one integration target.")
+            return
+        files = find_chrom_csv_files(csv_folder)
+        if not files:
+            QMessageBox.warning(self, "No CSVs", "No chromatogram CSVs were found.")
             return
 
-        targets = []
-        for row in range(self.target_table.rowCount()):
-            center_item = self.target_table.item(row, 0)
-            minus_item = self.target_table.item(row, 1)
-            plus_item = self.target_table.item(row, 2)
-            if not center_item or not minus_item or not plus_item:
-                continue
+        headers = ["Sample"] + [f"{center:.3f} min" for center, _, _ in self.targets]
+        rows = []
+        processed = 0
+        for sample_name, path in files:
             try:
-                targets.append((
-                    float(center_item.text()),
-                    float(minus_item.text()),
-                    float(plus_item.text()),
-                ))
-            except ValueError:
-                continue
-
-        if not targets:
-            QMessageBox.critical(self, "Missing targets", "Define at least one valid integration target.")
-            return
-
-        for target in targets:
-            self.remember_recent_target(target)
-
-        csv_files = find_chrom_csv_files(folder)
-        if not csv_files:
-            QMessageBox.critical(self, "No CSVs found", "No chromatogram CSV files were found.")
-            return
-
-        results = []
-        for sample_name, path in csv_files:
-            try:
-                frame = pd.read_csv(path)
+                channels = read_chrom_csv_channels(path)
+                if not channels:
+                    raise ValueError("Empty or invalid chromatogram")
+                for channel_name, times, intensities in channels:
+                    areas = [
+                        integrate_peak_asym(times, intensities, center, tol_minus, tol_plus, smooth_win=5)
+                        for center, tol_minus, tol_plus in self.targets
+                    ]
+                    name = sample_name
+                    if len(channels) > 1:
+                        name = f"{sample_name}_{channel_name.replace(' ', '')}"
+                    rows.append({"Sample": name, **{header: f"{area:.6g}" for header, area in zip(headers[1:], areas)}})
+                processed += 1
             except Exception:
-                continue
-            rt_col = find_rt_column(frame)
-            signals = [col for col in frame.columns if col != rt_col]
-            for col in signals:
-                label = f"{sample_name}_{col}"
-                row_data = {"Sample": label}
-                for index, (center, minus, plus) in enumerate(targets, 1):
-                    area = integrate_chrom_peak(frame, rt_col, col, center, minus, plus)
-                    row_data[f"Peak_{index}_Area"] = area
-                results.append(row_data)
+                rows.append({"Sample": sample_name, **{header: "0" for header in headers[1:]}})
 
-        if not results:
-            QMessageBox.critical(self, "Integration failed", "Could not calculate areas for any files.")
-            return
-
-        out_path = os.path.join(folder, "00_evaluated_data.csv")
+        output_path = os.path.join(csv_folder, "00_evaluated_data.csv")
         try:
-            pd.DataFrame(results).to_csv(out_path, index=False)
-        except Exception as exc:
-            QMessageBox.critical(self, "Write failed", f"Could not write {out_path}: {exc}")
+            with open(output_path, "w", newline="", encoding="utf-8") as output_file:
+                writer = csv.DictWriter(output_file, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(rows)
+        except OSError as exc:
+            QMessageBox.critical(self, "Write failed", str(exc))
             return
+        QMessageBox.information(self, "Integration complete", f"Integrated {processed} file(s).\nSaved to:\n{output_path}")
+        self.statusBar().showMessage(f"Integration complete: {processed}/{len(files)} files")
 
-        self.statusBar().showMessage(f"Evaluated data written: {out_path}")
-        QMessageBox.information(
-            self,
-            "Success",
-            f"Integration completed for {len(results)} series.\nOutput saved to:\n{out_path}",
-        )
     def browse_plot_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder with chromatogram CSVs")
         if folder:
@@ -1610,29 +1600,32 @@ class MassLynxWindow(QMainWindow):
     def refresh_plot_files(self):
         folder = self.plot_folder_edit.text().strip()
         self.plot_file_table.setRowCount(0)
-        self.plot_signal_combo.clear()
-        self.axes.clear()
-        self.plot_canvas.draw_idle()
-        if not folder or not os.path.isdir(folder):
-            self.plot_status_label.setText("Select a valid folder to inspect CSV files.")
-            return
-
-        files = find_chrom_csv_files(folder, include_evaluated=True)
-        self.plot_file_table.setRowCount(len(files))
-        for row, (sample_name, path) in enumerate(files):
-            relative_dir = os.path.relpath(os.path.dirname(path), folder)
-            subfolder = "(root)" if relative_dir in {"", "."} else relative_dir
-            csv_type = classify_csv_type(path)
-            filename_item = QTableWidgetItem(os.path.basename(path))
-            filename_item.setData(Qt.ItemDataRole.UserRole, path)
-            type_item = QTableWidgetItem(csv_type)
-            subfolder_item = QTableWidgetItem(subfolder)
-            self.plot_file_table.setItem(row, 0, filename_item)
-            self.plot_file_table.setItem(row, 1, type_item)
-            self.plot_file_table.setItem(row, 2, subfolder_item)
-        self.plot_status_label.setText(f"Found {len(files)} CSV file(s).")
-        if files:
+        if os.path.isdir(folder):
+            for sample_name, path in find_chrom_csv_files(folder, include_evaluated=True):
+                row = self.plot_file_table.rowCount()
+                self.plot_file_table.insertRow(row)
+                filename = os.path.basename(path)
+                subfolder = os.path.dirname(sample_name) or "(root)"
+                filename_item = QTableWidgetItem(filename)
+                filename_item.setData(Qt.ItemDataRole.UserRole, path)
+                filename_item.setToolTip(path)
+                self.plot_file_table.setItem(row, 0, filename_item)
+                self.plot_file_table.setItem(row, 1, QTableWidgetItem(classify_csv_type(path)))
+                self.plot_file_table.setItem(row, 2, QTableWidgetItem(subfolder))
+        if self.plot_file_table.rowCount():
             self.plot_file_table.selectRow(0)
+            self.load_plot_csv()
+        else:
+            self.plot_dataframe = None
+            self.plot_csv_type = "CSV"
+            self.plot_signal_combo.clear()
+            self.csv_preview_table.clear()
+            self.csv_preview_table.setRowCount(0)
+            self.csv_preview_table.setColumnCount(0)
+            self.csv_preview_status.setText("Select a CSV file to inspect its rows.")
+            self.plot_status_label.setText("No CSV data files found.")
+            self.update_plot()
+
     def load_plot_csv(self, *_args):
         selected_rows = self.plot_file_table.selectionModel().selectedRows()
         path = None
@@ -1893,6 +1886,41 @@ class MassLynxWindow(QMainWindow):
         subfolder = self.plot_file_table.item(row, 2).text()
         return filename if subfolder == "(root)" else os.path.join(subfolder, filename)
 
+    def export_plot_clicked(self):
+        if not self.axes.has_data():
+            QMessageBox.warning(self, "Nothing to export", "Load a CSV and select at least one signal first.")
+            return
+        filters = "PNG image (*.png);;SVG image (*.svg)"
+        filename, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export chromatogram plot",
+            "chromatogram.png",
+            filters,
+        )
+        if not filename:
+            return
+        if not os.path.splitext(filename)[1]:
+            extension = ".svg" if "SVG" in selected_filter else ".png"
+            filename += extension
+        try:
+            self.export_plot_to(filename, self.plot_export_dpi.value())
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        self.statusBar().showMessage(f"Plot exported: {filename}")
+
+    def export_plot_to(self, filename: str, dpi: int = 600):
+        extension = os.path.splitext(filename)[1].lower()
+        if extension not in {".png", ".svg"}:
+            raise ValueError("Choose PNG or SVG format.")
+        if not 72 <= dpi <= 2400:
+            raise ValueError("Export DPI must be between 72 and 2400.")
+        self.figure.savefig(filename, format=extension[1:], bbox_inches="tight", dpi=dpi)
+
+
+# ---------------------------
+# Run
+# ---------------------------
 if __name__ == "__main__":
     qt_app = QApplication(sys.argv)
     window = MassLynxWindow()
