@@ -7,8 +7,11 @@ import re
 import csv
 import json
 import math
+import gzip
 import fnmatch
 import datetime
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
 import subprocess
 from typing import List, Optional
 
@@ -55,6 +58,8 @@ from PySide6.QtWidgets import (
 )
 from rainbow.waters import masslynx
 
+# ---------------------------
+# Utility helpers & logging
 # ---------------------------
 
 def console_log(message: str, category: str = "APP", level: str = "INFO"):
@@ -756,6 +761,58 @@ def integrate_peak_asym(times, intens, center, tol_minus, tol_plus, smooth_win=5
     return area
 
 
+# ---------------------------
+# KDE LabPlot export helpers (imported from Waters_LabPlot_Exporter)
+# ---------------------------
+
+try:
+    from Waters_Integrator_exporter import (
+        create_labplot_project,
+        export_labplot_script,
+        generate_labplot_lml_project,
+        create_veusz_project,
+        generate_veusz_vsz_project,
+        LabPlotExporterWindow,
+    )
+except ImportError:
+    try:
+        from Waters_LabPlot_Exporter import (
+            create_labplot_project,
+            export_labplot_script,
+            generate_labplot_lml_project,
+            create_veusz_project,
+            generate_veusz_vsz_project,
+            LabPlotExporterWindow,
+        )
+    except ImportError:
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        if _script_dir not in sys.path:
+            sys.path.insert(0, _script_dir)
+        try:
+            from Waters_Integrator_exporter import (
+                create_labplot_project,
+                export_labplot_script,
+                generate_labplot_lml_project,
+                create_veusz_project,
+                generate_veusz_vsz_project,
+                LabPlotExporterWindow,
+            )
+        except ImportError:
+            from Waters_LabPlot_Exporter import (
+                create_labplot_project,
+                export_labplot_script,
+                generate_labplot_lml_project,
+                create_veusz_project,
+                generate_veusz_vsz_project,
+                LabPlotExporterWindow,
+            )
+
+
+
+
+# ---------------------------
+# GUI
+# ---------------------------
 class QtConsoleStream(QObject):
     text_written = Signal(str, str)
 
@@ -940,12 +997,57 @@ class GripSplitter(QSplitter):
 
 
 class MassLynxWindow(QMainWindow):
-    def __init__(self, original_stream=None, stream_type="stdout"):
+    def __init__(self):
         super().__init__()
-        self.original_stream = original_stream
-        self.stream_type = stream_type
+        self.setWindowTitle("MassLynx | Chromatography workspace")
+        self.resize(960, 720)
+        self.setMinimumSize(640, 480)
 
-    @property
+        self.targets = []
+        self.plot_paths = {}
+        self.plot_dataframe = None
+        self.plot_csv_type = "CSV"
+        self.settings = QSettings("danield4n13l", "MassLynxIntegrator")
+        self.settings_json_path = get_settings_json_path()
+        self.templates = {}
+        self.recent_targets = []
+        if os.path.exists(self.settings_json_path):
+            try:
+                with open(self.settings_json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.templates = data.get("templates", {})
+                        self.recent_targets = data.get("recentTargets", [])
+            except Exception:
+                pass
+        if not self.templates:
+            try:
+                self.templates = json.loads(self.settings.value("templates", "{}"))
+            except (TypeError, json.JSONDecodeError):
+                self.templates = {}
+        if not self.recent_targets:
+            try:
+                self.recent_targets = json.loads(self.settings.value("recentTargets", "[]"))
+            except (TypeError, json.JSONDecodeError):
+                self.recent_targets = []
+        if not isinstance(self.recent_targets, list):
+            self.recent_targets = []
+        if not isinstance(self.templates, dict):
+            self.templates = {}
+        self._sync_settings_json()
+        self.native_style_name = QApplication.style().objectName()
+        self.system_palette = QPalette(QApplication.palette())
+        self._responsive_narrow = None
+        self.figure = Figure(figsize=(8, 4), dpi=100, constrained_layout=True)
+        self.axes = self.figure.add_subplot(111)
+
+        self._build_ui()
+        console_log(
+            f"MassLynx workspace initialized | Config: {self.settings_json_path} "
+            f"({len(self.templates)} templates, {len(self.recent_targets)} recent targets loaded)",
+            category="INIT",
+        )
+
     def _build_ui(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -993,18 +1095,20 @@ class MassLynxWindow(QMainWindow):
         self._build_extraction_section(content_layout)
         self._build_integration_section(content_layout)
         self._build_plot_section(content_layout)
+        self._build_labplot_section(content_layout)
         self.sections = content.findChildren(CollapsibleSection)
         for section in self.sections:
             section.expandedChanged.connect(self.handle_section_expanded)
         content_layout.addStretch(1)
         scroll.setWidget(content)
         self.setCentralWidget(scroll)
-        self.statusBar().showMessage("Ready")
         self._build_console_drawer()
+        self.statusBar().showMessage("Ready")
         self.theme_style_combo.currentIndexChanged.connect(self.apply_theme)
         self.theme_mode_combo.currentIndexChanged.connect(self.apply_theme)
         QApplication.styleHints().colorSchemeChanged.connect(self.apply_theme)
         self.apply_theme()
+
     def apply_theme(self, *_args):
         app = QApplication.instance()
         mode = self.theme_mode_combo.currentData() or "system"
@@ -1415,6 +1519,7 @@ class MassLynxWindow(QMainWindow):
         try:
             channels = read_chrom_csv_channels(path)
         except (OSError, csv.Error) as exc:
+            console_log(f"Cannot read sample for preview '{path}': {exc}", category="UI-PREVIEW", level="WARN")
             self.integration_preview_status.setText(f"Could not read sample: {exc}")
             return
         csv_type = classify_csv_type(path)
@@ -1440,6 +1545,7 @@ class MassLynxWindow(QMainWindow):
                         self.integration_mz_scan_combo.addItem(f"{rt_value:g} min", row_index)
                 self.integration_mz_scan_combo.blockSignals(False)
             except (OSError, ValueError, KeyError) as exc:
+                console_log(f"Failed loading m/z scans for '{path}': {exc}", category="UI-PREVIEW", level="WARN")
                 self.integration_preview_status.setText(f"Could not load m/z scans: {exc}")
                 return
 
@@ -1482,6 +1588,7 @@ class MassLynxWindow(QMainWindow):
             self.integration_axes.grid(True, axis="y", alpha=0.3)
             self.integration_preview_status.setText(f"m/z | Mass spectrum at RT {rt_value:g} min")
             self.integration_canvas.draw_idle()
+            console_log(f"Integration preview: {self.integration_preview_combo.currentText()} (m/z spectrum at RT={rt_value:g} min, {len(masses)} mass bins)", category="UI-PREVIEW")
             return
 
         if is_mz:
@@ -1513,6 +1620,7 @@ class MassLynxWindow(QMainWindow):
         self.integration_preview_status.setText(
             f"{csv_type} | {len(times)} points | shaded regions are target windows"
         )
+        console_log(f"Integration preview updated: '{self.integration_preview_combo.currentText()}' (channel: '{selected_name}', {len(times)} points, {len(self.targets)} target windows)", category="UI-PREVIEW")
 
     def _build_template_menu(self, parent_layout):
         self.template_button = QToolButton()
@@ -1548,6 +1656,12 @@ class MassLynxWindow(QMainWindow):
         actions.addWidget(load_button)
         actions.addWidget(delete_button)
         template_layout.addLayout(actions)
+
+        open_json_btn = QPushButton("Open JSON folder in Explorer")
+        open_json_btn.setObjectName("secondaryButton")
+        open_json_btn.setToolTip("Open the folder containing the settings & templates JSON file")
+        open_json_btn.clicked.connect(self.open_settings_json_folder)
+        template_layout.addWidget(open_json_btn)
         template_action = QWidgetAction(self.template_menu)
         template_action.setDefaultWidget(template_panel)
         self.template_menu.addAction(template_action)
@@ -1577,6 +1691,7 @@ class MassLynxWindow(QMainWindow):
         self.recent_targets.insert(0, normalized)
         self.recent_targets = self.recent_targets[:20]
         self.settings.setValue("recentTargets", json.dumps(self.recent_targets))
+        self._sync_settings_json()
         self.refresh_recent_targets()
 
     def load_recent_target(self):
@@ -1611,7 +1726,9 @@ class MassLynxWindow(QMainWindow):
             "targets": [list(target) for target in self.targets],
         }
         self.settings.setValue("templates", json.dumps(self.templates, ensure_ascii=False))
+        self._sync_settings_json()
         self.refresh_template_combo(name)
+        console_log(f"Saved options template '{name}' ({len(self.targets)} targets, raw_root='{self.raw_root_edit.text().strip()}')", category="TEMPLATES")
         self.statusBar().showMessage(f"Saved template: {name}")
 
     def load_template(self):
@@ -1643,6 +1760,7 @@ class MassLynxWindow(QMainWindow):
             self.refresh_raw_preview()
         self.refresh_plot_files()
         self.refresh_integration_preview_files()
+        console_log(f"Loaded options template '{name}' ({len(self.targets)} targets, raw_root='{template.get('raw_root', '')}')", category="TEMPLATES")
         self.statusBar().showMessage(f"Loaded template: {name}")
 
     def delete_template(self):
@@ -1651,7 +1769,9 @@ class MassLynxWindow(QMainWindow):
             return
         del self.templates[name]
         self.settings.setValue("templates", json.dumps(self.templates, ensure_ascii=False))
+        self._sync_settings_json()
         self.refresh_template_combo()
+        console_log(f"Deleted options template '{name}'", category="TEMPLATES")
         self.statusBar().showMessage(f"Deleted template: {name}")
 
     def _build_plot_section(self, parent_layout):
@@ -1788,6 +1908,240 @@ class MassLynxWindow(QMainWindow):
         splitter.setCollapsible(1, False)
         splitter.setSizes([280, 500])
         section.body_layout.addWidget(splitter, 1)
+
+    def _build_labplot_section(self, parent_layout):
+        section = CollapsibleSection("04  Veusz project export (LabPlot deprecated)", expanded=False)
+        parent_layout.addWidget(section)
+
+        form = QGridLayout()
+        section.body_layout.addLayout(form)
+
+        self.labplot_folder_edit = QLineEdit()
+        self.labplot_folder_edit.setPlaceholderText("CSV folder containing datasets to import")
+        labplot_folder_btns = QHBoxLayout()
+        labplot_folder_btns.setContentsMargins(0, 0, 0, 0)
+        labplot_folder_btns.setSpacing(6)
+        browse_folder = QPushButton("Browse")
+        browse_folder.setObjectName("secondaryButton")
+        browse_folder.clicked.connect(self.browse_labplot_folder)
+        open_labplot_folder = QPushButton("Open")
+        open_labplot_folder.setObjectName("secondaryButton")
+        open_labplot_folder.setToolTip("Open folder in file explorer")
+        open_labplot_folder.clicked.connect(lambda: self.open_folder_in_explorer(self.labplot_folder_edit.text()))
+        labplot_folder_btns.addWidget(browse_folder)
+        labplot_folder_btns.addWidget(open_labplot_folder)
+        form.addWidget(QLabel("CSV folder"), 0, 0)
+        form.addWidget(self.labplot_folder_edit, 0, 1)
+        form.addLayout(labplot_folder_btns, 0, 2)
+
+        self.labplot_output_edit = QLineEdit()
+        self.labplot_output_edit.setPlaceholderText("Veusz project output file path (.vsz)")
+        labplot_output_btns = QHBoxLayout()
+        labplot_output_btns.setContentsMargins(0, 0, 0, 0)
+        labplot_output_btns.setSpacing(6)
+        browse_output = QPushButton("Browse")
+        browse_output.setObjectName("secondaryButton")
+        browse_output.clicked.connect(self.browse_labplot_output)
+        open_labplot_output = QPushButton("Open")
+        open_labplot_output.setObjectName("secondaryButton")
+        open_labplot_output.setToolTip("Open project folder in file explorer")
+        open_labplot_output.clicked.connect(lambda: self.open_folder_in_explorer(self.labplot_output_edit.text()))
+        labplot_output_btns.addWidget(browse_output)
+        labplot_output_btns.addWidget(open_labplot_output)
+        form.addWidget(QLabel("Output project"), 1, 0)
+        form.addWidget(self.labplot_output_edit, 1, 1)
+        form.addLayout(labplot_output_btns, 1, 2)
+
+        self.labplot_add_plots_checkbox = QCheckBox("Add default plot pages (XY chromatograms / Categorical bar charts)")
+        self.labplot_add_plots_checkbox.setChecked(True)
+        form.addWidget(self.labplot_add_plots_checkbox, 2, 0, 1, 3)
+
+        action_layout = QHBoxLayout()
+        export_veusz_button = QPushButton("Create Veusz project (.vsz)")
+        export_veusz_button.clicked.connect(self.export_veusz_clicked)
+        action_layout.addWidget(export_veusz_button)
+
+        open_standalone_btn = QPushButton("Open Standalone Veusz Exporter…")
+        open_standalone_btn.setObjectName("secondaryButton")
+        open_standalone_btn.setToolTip("Open full standalone Veusz Exporter window with dataset selection, preview, and options")
+        open_standalone_btn.clicked.connect(self.open_standalone_labplot_exporter)
+        action_layout.addWidget(open_standalone_btn)
+
+        export_button = QPushButton("Export to LabPlot (Deprecated)")
+        export_button.setObjectName("secondaryButton")
+        export_button.clicked.connect(self.export_labplot_clicked)
+        action_layout.addWidget(export_button)
+
+        action_layout.addStretch(1)
+        section.body_layout.addLayout(action_layout)
+
+        self.labplot_status_label = QLabel("Select a CSV folder and target Veusz project path (.vsz).")
+        self.labplot_status_label.setWordWrap(True)
+        section.body_layout.addWidget(self.labplot_status_label)
+
+    def open_standalone_labplot_exporter(self):
+        folder = self.labplot_folder_edit.text().strip() or self.csv_folder_edit.text().strip()
+        console_log(f"Launching standalone Veusz Exporter window (folder='{folder}')", category="UI-EXPORTER")
+        self._labplot_exporter_window = LabPlotExporterWindow(initial_folder=folder if os.path.isdir(folder) else None)
+        self._labplot_exporter_window.show()
+
+    def browse_labplot_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder with CSV datasets")
+        if folder:
+            self.labplot_folder_edit.setText(folder)
+            if not self.labplot_output_edit.text().strip():
+                self.labplot_output_edit.setText(os.path.join(folder, "Waters_Veusz_Project.vsz"))
+
+    def browse_labplot_output(self):
+        filters = "Veusz Project (*.vsz);;LabPlot Project (Deprecated) (*.lml);;All Files (*.*)"
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select project output path",
+            self.labplot_output_edit.text().strip() or "Waters_Veusz_Project.vsz",
+            filters,
+        )
+        if filename:
+            self.labplot_output_edit.setText(filename)
+
+
+    def export_labplot_clicked(self):
+        csv_folder = self.labplot_folder_edit.text().strip()
+        if not csv_folder or not os.path.isdir(csv_folder):
+            csv_folder = self.csv_folder_edit.text().strip()
+            if os.path.isdir(csv_folder):
+                self.labplot_folder_edit.setText(csv_folder)
+
+        if not csv_folder or not os.path.isdir(csv_folder):
+            QMessageBox.warning(self, "Invalid folder", "Select a valid CSV folder to export.")
+            return
+
+        output_path = self.labplot_output_edit.text().strip()
+        if not output_path or output_path.casefold().endswith(".vsz"):
+            base_name = os.path.splitext(output_path)[0] if output_path else "Waters_LabPlot_Project"
+            output_path = (os.path.join(csv_folder, f"{os.path.basename(base_name)}.lml")
+                           if not os.path.isabs(base_name) else f"{base_name}.lml")
+            self.labplot_output_edit.setText(output_path)
+
+        add_plots = self.labplot_add_plots_checkbox.isChecked()
+        console_log(f"Exporting KDE LabPlot project: folder='{csv_folder}' -> output='{output_path}' (add_plots={add_plots})", category="UI-LABPLOT")
+
+        self.labplot_status_label.setText("Exporting LabPlot project...")
+        self.statusBar().showMessage("Exporting LabPlot project...")
+        QApplication.processEvents()
+
+        try:
+            final_path = create_labplot_project(
+                csv_folder=csv_folder,
+                output_path=output_path,
+                add_plots=add_plots,
+                status_cb=lambda msg: self.statusBar().showMessage(msg),
+            )
+            msg = (
+                f"KDE LabPlot project created successfully!\n\n"
+                f"Project file: {final_path}\n"
+                f"Imported CSV folder: {csv_folder}\n"
+                f"Default plots created: {'Yes' if add_plots else 'No'}"
+            )
+            self.labplot_status_label.setText(f"Exported: {final_path}")
+            self.statusBar().showMessage(f"LabPlot project created: {final_path}")
+            console_log(f"KDE LabPlot project successfully created: {final_path}", category="UI-LABPLOT")
+            QMessageBox.information(self, "LabPlot project created", msg)
+        except Exception as exc:
+            console_log(f"KDE LabPlot project creation failed: {exc}", category="UI-LABPLOT", level="ERROR")
+            self.labplot_status_label.setText(f"Export failed: {exc}")
+            self.statusBar().showMessage("LabPlot export failed")
+            QMessageBox.critical(self, "LabPlot export failed", str(exc))
+
+    def export_veusz_clicked(self):
+        csv_folder = self.labplot_folder_edit.text().strip()
+        if not csv_folder or not os.path.isdir(csv_folder):
+            csv_folder = self.csv_folder_edit.text().strip()
+            if os.path.isdir(csv_folder):
+                self.labplot_folder_edit.setText(csv_folder)
+
+        if not csv_folder or not os.path.isdir(csv_folder):
+            QMessageBox.warning(self, "Invalid folder", "Select a valid CSV folder to export.")
+            return
+
+        output_path = self.labplot_output_edit.text().strip()
+        if not output_path or output_path.casefold().endswith((".lml", ".lml.gz", ".py")):
+            base_name = os.path.splitext(output_path)[0] if output_path else "Waters_Veusz_Project"
+            if base_name.casefold().endswith(".lml"):
+                base_name = base_name[:-4]
+            output_path = (os.path.join(csv_folder, f"{os.path.basename(base_name)}.vsz")
+                           if not os.path.isabs(base_name) else f"{base_name}.vsz")
+            self.labplot_output_edit.setText(output_path)
+
+        add_plots = self.labplot_add_plots_checkbox.isChecked()
+        console_log(f"Exporting Veusz project: folder='{csv_folder}' -> output='{output_path}' (add_plots={add_plots})", category="UI-VEUSZ")
+
+        self.labplot_status_label.setText("Exporting Veusz project...")
+        self.statusBar().showMessage("Exporting Veusz project...")
+        QApplication.processEvents()
+
+        try:
+            final_path = create_veusz_project(
+                csv_folder=csv_folder,
+                output_path=output_path,
+                add_plots=add_plots,
+                embed_data=True,
+                status_cb=lambda msg: self.statusBar().showMessage(msg),
+            )
+            msg = (
+                f"Veusz project created successfully!\n\n"
+                f"Project file: {final_path}\n"
+                f"Imported CSV folder: {csv_folder}\n"
+                f"Default plots created: {'Yes' if add_plots else 'No'}"
+            )
+            self.labplot_status_label.setText(f"Exported: {final_path}")
+            self.statusBar().showMessage(f"Veusz project created: {final_path}")
+            console_log(f"Veusz project successfully created: {final_path}", category="UI-VEUSZ")
+            QMessageBox.information(self, "Veusz project created", msg)
+        except Exception as exc:
+            console_log(f"Veusz project creation failed: {exc}", category="UI-VEUSZ", level="ERROR")
+            self.labplot_status_label.setText(f"Export failed: {exc}")
+            self.statusBar().showMessage("Veusz export failed")
+            QMessageBox.critical(self, "Veusz export failed", str(exc))
+
+
+    def _sync_settings_json(self):
+        try:
+            os.makedirs(os.path.dirname(self.settings_json_path), exist_ok=True)
+            with open(self.settings_json_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "templates": self.templates,
+                        "recentTargets": self.recent_targets,
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+        except Exception as exc:
+            console_log(f"Failed to sync settings JSON to {self.settings_json_path}: {exc}", category="SETTINGS", level="WARN")
+
+    def open_settings_json_folder(self):
+        self._sync_settings_json()
+        folder = os.path.dirname(self.settings_json_path)
+        console_log(f"User requested opening settings JSON folder: {folder}", category="SETTINGS")
+        if not open_in_explorer(self.settings_json_path):
+            QMessageBox.warning(
+                self,
+                "Folder not found",
+                f"Could not open settings folder:\n{folder}",
+            )
+        else:
+            self.statusBar().showMessage(f"Opened JSON settings folder: {folder}")
+
+    def open_folder_in_explorer(self, folder_path: str):
+        if not folder_path or not str(folder_path).strip():
+            QMessageBox.warning(self, "No folder specified", "Please select or enter a folder path first.")
+            return
+        console_log(f"User requested opening folder in explorer: {folder_path}", category="EXPLORER")
+        if not open_in_explorer(folder_path):
+            QMessageBox.warning(self, "Folder not found", f"The chosen folder does not exist:\n{folder_path}")
+        else:
+            self.statusBar().showMessage(f"Opened folder in file explorer: {folder_path}")
 
     def _build_console_drawer(self):
         self.console_dock = QDockWidget("Debug Console", self)
@@ -2034,6 +2388,7 @@ class MassLynxWindow(QMainWindow):
         self.center_edit.clear()
         self.tol_minus_edit.clear()
         self.tol_plus_edit.clear()
+        console_log(f"Target added: RT={center:.3f} min (-{tol_minus:.3f}, +{tol_plus:.3f}) min (total targets: {len(self.targets)})", category="TARGETS")
         if self.integration_preview_toggle.isChecked():
             self.update_integration_preview()
 
@@ -2042,6 +2397,7 @@ class MassLynxWindow(QMainWindow):
         for row in selected:
             self.target_table.removeRow(row)
             del self.targets[row]
+        console_log(f"Deleted {len(selected)} target(s). Remaining targets: {len(self.targets)}", category="TARGETS")
         if selected and self.integration_preview_toggle.isChecked():
             self.update_integration_preview()
 
@@ -2100,15 +2456,6 @@ class MassLynxWindow(QMainWindow):
         QMessageBox.information(self, "Integration complete", f"Integrated {processed} file(s).\nSaved to:\n{output_path}")
         self.statusBar().showMessage(f"Integration complete: {processed}/{len(files)} files")
 
-    def open_folder_in_explorer(self, folder_path: str):
-        if not folder_path or not os.path.exists(folder_path):
-            QMessageBox.information(
-                self,
-                "Directory not found",
-                f"The directory does not exist yet:\n{folder_path}",
-            )
-            return
-        open_in_explorer(folder_path)
     def browse_plot_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder with chromatogram CSVs")
         if folder:
@@ -2130,6 +2477,7 @@ class MassLynxWindow(QMainWindow):
                 self.plot_file_table.setItem(row, 0, filename_item)
                 self.plot_file_table.setItem(row, 1, QTableWidgetItem(classify_csv_type(path)))
                 self.plot_file_table.setItem(row, 2, QTableWidgetItem(subfolder))
+        console_log(f"Refreshed plot file list for folder '{folder}' (found {self.plot_file_table.rowCount()} CSVs)", category="UI-PLOT")
         if self.plot_file_table.rowCount():
             self.plot_file_table.selectRow(0)
             self.load_plot_csv()
@@ -2162,6 +2510,7 @@ class MassLynxWindow(QMainWindow):
         try:
             frame = pd.read_csv(path)
         except Exception as exc:
+            console_log(f"Failed reading plot CSV '{path}': {exc}", category="UI-PLOT", level="WARN")
             self.plot_dataframe = None
             self.plot_csv_type = "CSV"
             self.csv_preview_table.clear()
@@ -2208,6 +2557,11 @@ class MassLynxWindow(QMainWindow):
             self.plot_mz_axis_combo.setCurrentIndex(self.plot_mz_axis_combo.findData("rt"))
         self.plot_mz_scan_combo.blockSignals(False)
         self.plot_mz_axis_combo.blockSignals(False)
+        console_log(
+            f"Loaded CSV for preview: '{os.path.basename(path)}' | Type: {self.plot_csv_type} | "
+            f"Shape: {frame.shape[0]} rows x {frame.shape[1]} cols | Signals: {len(signal_columns)}",
+            category="UI-PLOT",
+        )
         self.populate_csv_preview(frame)
         self.update_plot()
 
@@ -2394,6 +2748,11 @@ class MassLynxWindow(QMainWindow):
             status = f"Showing {plotted} {self.plot_csv_type} trace(s)."
         self.plot_status_label.setText(status)
         self.plot_canvas.draw_idle()
+        console_log(
+            f"Updated plot preview: '{self.current_plot_title()}' | Type: {self.plot_csv_type} | "
+            f"Plotted traces: {plotted} | Overlay: {self.plot_all_checkbox.isChecked()}",
+            category="UI-PLOT",
+        )
 
     def current_plot_title(self):
         selected_rows = self.plot_file_table.selectionModel().selectedRows()
@@ -2423,6 +2782,7 @@ class MassLynxWindow(QMainWindow):
         try:
             self.export_plot_to(filename, self.plot_export_dpi.value())
         except (OSError, ValueError) as exc:
+            console_log(f"Export failed for '{filename}': {exc}", category="UI-EXPORT", level="ERROR")
             QMessageBox.critical(self, "Export failed", str(exc))
             return
         self.statusBar().showMessage(f"Plot exported: {filename}")
@@ -2433,17 +2793,9 @@ class MassLynxWindow(QMainWindow):
             raise ValueError("Choose PNG or SVG format.")
         if not 72 <= dpi <= 2400:
             raise ValueError("Export DPI must be between 72 and 2400.")
+        console_log(f"Exporting chromatogram plot to '{filename}' (DPI={dpi}, format={extension[1:].upper()})", category="UI-EXPORT")
         self.figure.savefig(filename, format=extension[1:], bbox_inches="tight", dpi=dpi)
-
-
-# ---------------------------
-# Run
-# ---------------------------
-
-
-# ---------------------------
-# Run
-# ---------------------------
+        console_log(f"Plot exported successfully: {filename}", category="UI-EXPORT")
 
 
 # ---------------------------
