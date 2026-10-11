@@ -8,6 +8,8 @@ import csv
 import json
 import math
 import fnmatch
+import datetime
+import subprocess
 from typing import List, Optional
 
 import pandas as pd
@@ -51,8 +53,76 @@ from PySide6.QtWidgets import (
 from rainbow.waters import masslynx
 
 # ---------------------------
-# Utility helpers
-# ---------------------------
+
+def console_log(message: str, category: str = "APP", level: str = "INFO"):
+    """
+    Emit a structured diagnostic log message to stdout.
+    Automatically captured by QtConsoleStream into the runtime console drawer.
+    """
+    now_str = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    cat_tag = f"[{category}]" if category else ""
+    print(f"[{now_str}] [{level.upper():<5}] {cat_tag} {message}", flush=True)
+
+
+def open_in_explorer(path: str) -> bool:
+    """Open a file or directory in the system's native file explorer."""
+    if not path or not str(path).strip():
+        console_log("open_in_explorer called with empty path", category="EXPLORER", level="WARN")
+        return False
+    clean_path = str(path).strip().strip('"').strip("'")
+    target_path = os.path.abspath(clean_path)
+
+    if not os.path.exists(target_path):
+        parent = os.path.dirname(target_path)
+        if os.path.exists(parent):
+            target_path = parent
+        else:
+            console_log(f"Cannot open in explorer; path not found: {clean_path}", category="EXPLORER", level="WARN")
+            return False
+
+    console_log(f"Opening explorer view for: {target_path}", category="EXPLORER", level="INFO")
+    if sys.platform == "win32":
+        try:
+            if os.path.isfile(target_path):
+                subprocess.Popen(["explorer", f"/select,{os.path.normpath(target_path)}"])
+            else:
+                os.startfile(os.path.normpath(target_path))
+            return True
+        except Exception as exc:
+            console_log(f"Win32 explorer open failed: {exc}", category="EXPLORER", level="WARN")
+
+    try:
+        folder = target_path if os.path.isdir(target_path) else os.path.dirname(target_path)
+        url = QUrl.fromLocalFile(folder)
+        if QDesktopServices.openUrl(url):
+            return True
+    except Exception as exc:
+        console_log(f"QDesktopServices openUrl failed: {exc}", category="EXPLORER", level="WARN")
+
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", target_path])
+            return True
+        elif sys.platform.startswith("linux"):
+            folder = target_path if os.path.isdir(target_path) else os.path.dirname(target_path)
+            subprocess.Popen(["xdg-open", folder])
+            return True
+    except Exception as exc:
+        console_log(f"Subprocess desktop opener failed: {exc}", category="EXPLORER", level="WARN")
+
+    return False
+
+
+def get_settings_json_path() -> str:
+    """Return the absolute path to the settings/templates JSON file."""
+    app_data = os.environ.get("APPDATA")
+    if app_data:
+        config_dir = os.path.join(app_data, "danield4n13l", "MassLynxIntegrator")
+    else:
+        config_dir = os.path.join(os.path.expanduser("~"), ".config", "danield4n13l", "MassLynxIntegrator")
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, "templates_settings.json")
+
 
 def sanitize_filename(name: str, default: str = "sample") -> str:
     """Remove problematic characters for filenames."""
@@ -74,14 +144,15 @@ def sanitize_folder_path(path: str, default: str = "group") -> str:
 
 
 def find_rt_column(pdf: pd.DataFrame) -> str:
-    """
-    Try to find the RT column, defaulting to the first column if needed.
-    - Prefer a column whose name starts with 'rt' (case-insensitive).
-    """
+    """Try to find the RT column, prioritizing standard RT designations."""
     for c in pdf.columns:
-        if c.lower().startswith("rt"):
+        c_lower = str(c).strip().casefold()
+        if c_lower.startswith("rt") or "retention" in c_lower:
             return c
-    # fallback: first column
+    for c in pdf.columns:
+        c_lower = str(c).strip().casefold()
+        if c_lower.startswith("time") or c_lower == "t" or "min" in c_lower:
+            return c
     return pdf.columns[0]
 
 
@@ -179,6 +250,17 @@ def iter_raw_dirs(root: str) -> List[str]:
     return raw_dirs
 
 
+def _safe_parse_function(dat_path: str, prec: int = 0):
+    """Call masslynx.parse_function safely across different rainbow library versions."""
+    try:
+        return masslynx.parse_function(str(dat_path), display_precision=prec)
+    except TypeError:
+        try:
+            return masslynx.parse_function(str(dat_path), prec=prec)
+        except TypeError:
+            return masslynx.parse_function(str(dat_path))
+
+
 def process_func001(dat_path: str, base_name: str, mz_dir: str, tic_dir: str, prec: int = 0):
     """
     Process _FUNC001.DAT:
@@ -186,18 +268,23 @@ def process_func001(dat_path: str, base_name: str, mz_dir: str, tic_dir: str, pr
       - Create TIC CSV as <tic_dir>/<base_name>_tic.csv by summing all intensity
         columns (all columns except RT) row-wise.
     """
+    console_log(f"Processing _FUNC001.DAT for '{base_name}' from: {dat_path}", category="RAW-MS")
     os.makedirs(mz_dir, exist_ok=True)
     os.makedirs(tic_dir, exist_ok=True)
 
     mz_csv = os.path.join(mz_dir, f"{base_name}_mz.csv")
 
-    df = masslynx.parse_function(str(dat_path), prec=prec)
+    df = _safe_parse_function(dat_path, prec=prec)
     df.export_csv(mz_csv)
 
     pdf = pd.read_csv(mz_csv)
 
     rt_col = find_rt_column(pdf)
     intensity_cols = [c for c in pdf.columns if c != rt_col]
+    console_log(
+        f"Exported m/z CSV: {os.path.basename(mz_csv)} | {len(pdf)} scans, {len(intensity_cols)} mass channels (RT col: '{rt_col}')",
+        category="RAW-MS",
+    )
 
     if not intensity_cols:
         tic_series = pd.Series([0.0] * len(pdf))
@@ -211,6 +298,11 @@ def process_func001(dat_path: str, base_name: str, mz_dir: str, tic_dir: str, pr
 
     tic_csv = os.path.join(tic_dir, f"{base_name}_tic.csv")
     tic_df.to_csv(tic_csv, index=False)
+    max_tic = float(tic_series.max()) if not tic_series.empty else 0.0
+    console_log(
+        f"Exported TIC CSV: {os.path.basename(tic_csv)} | {len(tic_df)} points, peak TIC: {max_tic:.4g}",
+        category="RAW-MS",
+    )
 
 
 def process_func002(
@@ -228,10 +320,11 @@ def process_func002(
         with columns:
             RT (min), absorbance
     """
+    console_log(f"Processing _FUNC002.DAT (UV-Vis DAD) for '{base_name}' from: {dat_path}", category="RAW-DAD")
     os.makedirs(chrom_dir, exist_ok=True)
 
     temp_csv = os.path.join(chrom_dir, f"__temp_{base_name}_FUNC002.csv")
-    df = masslynx.parse_function(str(dat_path), prec=prec)
+    df = _safe_parse_function(dat_path, prec=prec)
     df.export_csv(temp_csv)
 
     pdf = pd.read_csv(temp_csv)
@@ -241,12 +334,16 @@ def process_func002(
         pass
 
     if pdf.empty or len(pdf.columns) < 2:
+        console_log(f"Skipping _FUNC002 for '{base_name}': empty data or insufficient channels ({len(pdf.columns)} cols)", category="RAW-DAD", level="WARN")
         return
 
     rt_col = find_rt_column(pdf)
     spec_cols = [c for c in pdf.columns if c != rt_col]
     selected = set(merge_wavelengths or [])
     merged_cols = {}
+    exported_count = 0
+
+    console_log(f"Found {len(spec_cols)} spectral wavelength channels for '{base_name}'", category="RAW-DAD")
 
     for col in spec_cols:
         wl_suffix = parse_wavelength_label(col)
@@ -259,6 +356,10 @@ def process_func002(
             "absorbance": pdf[col]
         })
         out_df.to_csv(out_csv, index=False)
+        exported_count += 1
+
+    if exported_count > 0:
+        console_log(f"Exported {exported_count} single-channel UV CSVs ({base_name}_*.csv) into: {chrom_dir}", category="RAW-DAD")
 
     available = [wl for wl in (merge_wavelengths or []) if wl in merged_cols]
     if available:
@@ -268,6 +369,7 @@ def process_func002(
         suffix = "_".join(merge_wavelengths or available)
         merged_csv = os.path.join(chrom_dir, f"{base_name}_{suffix}_nm.csv")
         merged_df.to_csv(merged_csv, index=False)
+        console_log(f"Exported merged UV chromatogram ({', '.join(available)} nm): {os.path.basename(merged_csv)} ({len(merged_df)} rows)", category="RAW-DAD")
 
 
 def extract_masslynx_folder(
@@ -296,9 +398,13 @@ def extract_masslynx_folder(
     os.makedirs(mz_dir, exist_ok=True)
     os.makedirs(tic_dir, exist_ok=True)
 
+    console_log(f"Scanning for MassLynx .raw directories under: {root}", category="EXTRACT")
     raw_dirs = iter_raw_dirs(root)
-    for raw_dir in raw_dirs:
-        match_group(os.path.basename(raw_dir), group_rules or [], match_mode)
+    console_log(f"Discovered {len(raw_dirs)} .raw directory run(s) containing .DAT data", category="EXTRACT")
+    if group_rules:
+        console_log(f"Configured {len(group_rules)} folder group rule(s) [Mode: {match_mode}]", category="EXTRACT")
+    if merge_wavelengths:
+        console_log(f"Merge wavelengths requested: {', '.join(merge_wavelengths)} nm", category="EXTRACT")
 
     if status_cb:
         status_cb(f"Found {len(raw_dirs)} .raw folder(s).")
@@ -329,6 +435,10 @@ def extract_masslynx_folder(
             sample_mz_dir = os.path.join(mz_dir, group) if group else mz_dir
             sample_tic_dir = os.path.join(tic_dir, group) if group else tic_dir
             sample_chrom_dir = os.path.join(chrom_dir, group) if group else chrom_dir
+            console_log(
+                f"[{idx+1}/{len(raw_dirs)}] Processing '{base_raw}' -> group '{group or '(root)'}' (MS _FUNC001: {'found' if func001 else 'none'}, DAD _FUNC002: {'found' if func002 else 'none'})",
+                category="EXTRACT",
+            )
             if func001:
                 process_func001(func001, base_name, sample_mz_dir, sample_tic_dir, prec=prec)
             if func002:
@@ -340,11 +450,14 @@ def extract_masslynx_folder(
                     merge_wavelengths=merge_wavelengths,
                 )
             processed += 1
-        except Exception:
+        except Exception as exc:
             failed += 1
+            console_log(f"Failed extracting run '{base_raw}': {exc}", category="EXTRACT", level="ERROR")
 
+    msg = f"Done: processed {processed}, failed {failed}."
     if status_cb:
-        status_cb(f"Done: processed {processed}, failed {failed}.")
+        status_cb(msg)
+    console_log(f"Extraction completed: {processed} succeeded, {failed} failed. Chromatogram output: {chrom_dir}", category="EXTRACT")
     return chrom_dir
 
 
@@ -450,37 +563,105 @@ def find_chrom_csv_files(root: str, include_evaluated: bool = False) -> List[tup
 
 
 def classify_csv_type(path: str, headers=None) -> str:
-    """Identify MassLynx DAD, TIC, and m/z CSVs from names and headers."""
-    filename = os.path.basename(path).casefold()
-    if filename == "00_evaluated_data.csv":
-        return "Integrated areas"
-    path_parts = {part.casefold() for part in path.replace("\\", "/").split("/")}
-    if filename.endswith("_mz.csv") or "mz" in path_parts or "m/z" in path_parts:
-        return "m/z"
-    if filename.endswith("_tic.csv") or "tic" in path_parts:
-        return "TIC"
+    """Identify MassLynx DAD, TIC, m/z, or integrated area CSVs from names, paths, and headers."""
+    try:
+        if not path:
+            return "CSV"
+        clean_path = str(path).replace("\\", "/")
+        filename = os.path.basename(clean_path).casefold()
+        path_parts = {part.casefold() for part in clean_path.split("/")}
 
-    if headers is None:
-        try:
-            with open(path, "r", newline="", encoding="utf-8-sig") as source:
-                headers = next(csv.reader(source), [])
-        except (OSError, UnicodeError, csv.Error):
-            headers = []
-    normalized_headers = [str(header).strip().casefold() for header in headers]
-    if any(header in {"tic", "total ion current"} for header in normalized_headers):
-        return "TIC"
-    if filename.endswith("_nm.csv") or any(
-        header == "absorbance" or re.fullmatch(r"\d+(?:\.\d+)?\s*nm", header)
-        for header in normalized_headers
-    ):
-        return "DAD"
-    numeric_signals = sum(
-        bool(re.fullmatch(r"\d+(?:\.\d+)?", header))
-        for header in normalized_headers[1:]
-    )
-    if numeric_signals >= 2:
-        return "m/z"
-    return "CSV"
+        # 1. Integrated / Evaluated Area tables
+        if (
+            filename == "00_evaluated_data.csv"
+            or "evaluated" in filename
+            or "integrated" in filename
+            or "quant" in filename
+            or "peak_table" in filename
+            or "area" in filename
+        ):
+            return "Integrated areas"
+
+        # 2. Filename & Path-based detection for MS
+        if filename.endswith("_mz.csv") or "mz" in path_parts or "m/z" in path_parts:
+            return "m/z"
+        if filename.endswith("_tic.csv") or "tic" in path_parts or "_tic_" in filename:
+            return "TIC"
+
+        # 3. Read headers if not provided
+        if headers is None:
+            if not os.path.isfile(path):
+                return "CSV"
+            try:
+                with open(path, "r", newline="", encoding="utf-8-sig") as source:
+                    first_line = source.readline()
+                    for delim in (",", ";", "\t"):
+                        if delim in first_line:
+                            headers = [col.strip().strip('"').strip("'") for col in first_line.split(delim)]
+                            break
+                    if headers is None:
+                        headers = [first_line.strip()] if first_line else []
+            except (OSError, UnicodeError, csv.Error):
+                try:
+                    with open(path, "r", newline="", encoding="latin-1") as source:
+                        first_line = source.readline()
+                        for delim in (",", ";", "\t"):
+                            if delim in first_line:
+                                headers = [col.strip().strip('"').strip("'") for col in first_line.split(delim)]
+                                break
+                            if headers is None:
+                                headers = [first_line.strip()] if first_line else []
+                except Exception:
+                    headers = []
+
+        normalized_headers = [str(h).strip().casefold() for h in (headers or [])]
+
+        # 4. Check for Integrated areas from column structure
+        if normalized_headers and normalized_headers[0] in {
+            "sample", "sample name", "sample_name", "samplename", "name", "sample id", "sample_id"
+        }:
+            has_rt = any(h.startswith("rt") or "retention" in h or h == "time" for h in normalized_headers)
+            if not has_rt:
+                return "Integrated areas"
+
+        # 5. Check TIC from headers
+        if any(h in {"tic", "total ion current"} or "tic" in h for h in normalized_headers):
+            return "TIC"
+
+        # 6. Check m/z from column names or numeric mass channels
+        if any("m/z" in h or h == "mz" for h in normalized_headers):
+            return "m/z"
+
+        numeric_signals = sum(
+            bool(re.fullmatch(r"\d+(?:\.\d+)?", h))
+            for h in normalized_headers[1:]
+        )
+        if numeric_signals >= 2:
+            return "m/z"
+
+        # 7. Check DAD / UV from filename, paths, and headers
+        if (
+            filename.endswith("_nm.csv")
+            or "nm" in filename
+            or "dad" in path_parts
+            or "uv" in path_parts
+            or "pda" in path_parts
+            or any(
+                h == "absorbance"
+                or "absorbance" in h
+                or re.search(r"\d+\s*nm", h)
+                for h in normalized_headers
+            )
+        ):
+            return "DAD"
+
+        # 8. Check if inside chromatographic subfolder
+        if "chrom" in path_parts:
+            return "DAD"
+
+        return "CSV"
+    except Exception:
+        return "CSV"
 
 
 def moving_average(seq, window=5):
@@ -571,6 +752,7 @@ def integrate_peak_asym(times, intens, center, tol_minus, tol_plus, smooth_win=5
             area += 0.5 * (y_corr[k] + y_corr[k + 1]) * dt
     return area
 
+
 class CollapsibleSection(QWidget):
     expandedChanged = Signal(object, bool)
 
@@ -606,36 +788,30 @@ class CollapsibleSection(QWidget):
 
 
 class MassLynxWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, title: str, expanded: bool = True):
         super().__init__()
-        self.setWindowTitle("MassLynx | Chromatography workspace")
-        self.resize(1280, 900)
-        self.setMinimumSize(640, 440)
+        self.setObjectName("collapsibleSection")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        self.targets = []
-        self.plot_paths = {}
-        self.plot_dataframe = None
-        self.plot_csv_type = "CSV"
-        self.settings = QSettings("VBK_BSc_Thesis_FDA2026", "MassLynxIntegrator")
-        try:
-            self.recent_targets = json.loads(self.settings.value("recentTargets", "[]"))
-        except (TypeError, json.JSONDecodeError):
-            self.recent_targets = []
-        try:
-            self.templates = json.loads(self.settings.value("templates", "{}"))
-        except (TypeError, json.JSONDecodeError):
-            self.templates = {}
-        if not isinstance(self.recent_targets, list):
-            self.recent_targets = []
-        if not isinstance(self.templates, dict):
-            self.templates = {}
-        self.native_style_name = QApplication.style().objectName()
-        self.system_palette = QPalette(QApplication.palette())
-        self._responsive_narrow = None
-        self.figure = Figure(figsize=(8, 4), dpi=100, constrained_layout=True)
-        self.axes = self.figure.add_subplot(111)
+        self.toggle = QToolButton()
+        self.toggle.setObjectName("sectionToggle")
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.toggle.setSizePolicy(self.toggle.sizePolicy().horizontalPolicy(), self.toggle.sizePolicy().verticalPolicy())
+        layout.addWidget(self.toggle)
 
-        self._build_ui()
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(14, 10, 14, 14)
+        self.body_layout.setSpacing(10)
+        self.body.setVisible(expanded)
+        layout.addWidget(self.body)
+        self.toggle.toggled.connect(self._set_expanded)
 
     def _build_ui(self):
         scroll = QScrollArea()
@@ -869,15 +1045,28 @@ class MassLynxWindow(QMainWindow):
         browse_root = QPushButton("Browse")
         browse_root.setObjectName("secondaryButton")
         browse_root.clicked.connect(self.browse_raw_root)
+        open_root = QPushButton("Open")
+        open_root.setObjectName("secondaryButton")
+        open_root.setToolTip("Open folder in file explorer")
+        open_root.clicked.connect(lambda: self.open_folder_in_explorer(self.raw_root_edit.text()))
+        root_btn_layout = QHBoxLayout()
+        root_btn_layout.setContentsMargins(0, 0, 0, 0)
+        root_btn_layout.setSpacing(6)
+        root_btn_layout.addWidget(browse_root)
+        root_btn_layout.addWidget(open_root)
         form.addWidget(QLabel("RAW root"), 0, 0)
         form.addWidget(self.raw_root_edit, 0, 1)
-        form.addWidget(browse_root, 0, 2)
+        form.addLayout(root_btn_layout, 0, 2)
 
         self.merge_wavelengths_edit = QLineEdit()
         self.merge_wavelengths_edit.setPlaceholderText("e.g. 240, 270")
         form.addWidget(QLabel("Merge wavelengths (nm)"), 1, 0)
         form.addWidget(self.merge_wavelengths_edit, 1, 1, 1, 2)
 
+        self.group_rules_label = QLabel("Folder rules")
+        self.group_rules_label.setToolTip(
+            "Python uses modified PCRE2 flavor.\nUse \n\t(?P<name>...) for matching,\n\t\\g<name> for retrieving the group."
+            )
         self.group_rules_edit = QTextEdit()
         self.group_rules_edit.setPlaceholderText(
             "One rule per line: pattern => folder\n"
@@ -885,7 +1074,8 @@ class MassLynxWindow(QMainWindow):
             r"^(?P<batch>[^_]+)_(\d+)\.raw$ => \g<batch>/rep_\2"
         )
         self.group_rules_edit.setMaximumHeight(88)
-        form.addWidget(QLabel("Folder rules"), 2, 0, Qt.AlignmentFlag.AlignTop)
+        self.group_rules_edit.setCurrentFont(["Cascadia Code NF","Consolas", "monospace"])
+        form.addWidget(self.group_rules_label, 2, 0, Qt.AlignmentFlag.AlignTop)
         form.addWidget(self.group_rules_edit, 2, 1, 1, 2)
 
         mode_layout = QHBoxLayout()
@@ -928,9 +1118,18 @@ class MassLynxWindow(QMainWindow):
         browse = QPushButton("Browse")
         browse.setObjectName("secondaryButton")
         browse.clicked.connect(self.browse_csv_folder)
+        open_btn = QPushButton("Open")
+        open_btn.setObjectName("secondaryButton")
+        open_btn.setToolTip("Open folder in file explorer")
+        open_btn.clicked.connect(lambda: self.open_folder_in_explorer(self.csv_folder_edit.text()))
+        folder_btn_layout = QHBoxLayout()
+        folder_btn_layout.setContentsMargins(0, 0, 0, 0)
+        folder_btn_layout.setSpacing(6)
+        folder_btn_layout.addWidget(browse)
+        folder_btn_layout.addWidget(open_btn)
         folder_row.addWidget(QLabel("CSV folder"))
         folder_row.addWidget(self.csv_folder_edit, 1)
-        folder_row.addWidget(browse)
+        folder_row.addLayout(folder_btn_layout)
         section.body_layout.addLayout(folder_row)
 
         preview_controls = QHBoxLayout()
@@ -1445,13 +1644,16 @@ class MassLynxWindow(QMainWindow):
         rules = self.current_group_rules()
         if rules is None:
             return
+        console_log(f"Refreshing RAW preview: scanning '{root}' (mode: {self.current_match_mode()}, rules: {len(rules)})", category="UI-PREVIEW")
         raw_dirs = sorted(iter_raw_dirs(root))
+        console_log(f"Discovered {len(raw_dirs)} .raw directory runs in root folder", category="UI-PREVIEW")
         self.raw_preview_table.setRowCount(0)
         for raw_dir in raw_dirs[:20]:
             raw_name = os.path.basename(raw_dir)
             try:
                 destination = match_group(raw_name, rules, self.current_match_mode()) or "(root)"
             except ValueError as exc:
+                console_log(f"Rule match failed for '{raw_name}': {exc}", category="UI-PREVIEW", level="WARN")
                 QMessageBox.warning(self, "Invalid folder rule", str(exc))
                 return
             row = self.raw_preview_table.rowCount()
@@ -1483,6 +1685,11 @@ class MassLynxWindow(QMainWindow):
         rules = self.current_group_rules()
         if rules is None:
             return
+        console_log(
+            f"User initiated RAW extraction on '{root}' | Match mode: {self.current_match_mode()} | "
+            f"Rules: {len(rules)} | Merge wavelengths: {merge_wavelengths or 'none'}",
+            category="UI-EXTRACT",
+        )
         self.statusBar().showMessage("Extracting RAW files...")
         QApplication.processEvents()
         try:
@@ -1495,20 +1702,32 @@ class MassLynxWindow(QMainWindow):
                 match_mode=self.current_match_mode(),
             )
         except Exception as exc:
+            console_log(f"Extraction failed: {exc}", category="UI-EXTRACT", level="ERROR")
             QMessageBox.critical(self, "Extraction failed", str(exc))
             self.statusBar().showMessage("Extraction failed")
             return
         self.csv_folder_edit.setText(chrom_dir)
         self.plot_folder_edit.setText(chrom_dir)
+        self.labplot_folder_edit.setText(chrom_dir)
+        self.labplot_output_edit.setText(os.path.join(chrom_dir, "Waters_LabPlot_Project.lml"))
         self.refresh_plot_files()
         self.refresh_integration_preview_files()
-        QMessageBox.information(self, "Extraction complete", f"Chromatograms saved to:\n{chrom_dir}")
+        console_log(f"Extraction finished successfully -> {chrom_dir}", category="UI-EXTRACT")
+        QMessageBox.information(
+            self,
+            "Extraction complete",
+            f"Chromatographic CSV files were written to:\n{chrom_dir}\n\n" +
+            f"m/z and TIC CSVs are in sibling folders:\n" +
+            f"{os.path.dirname(chrom_dir)}"
+        )
         self.statusBar().showMessage(f"Extraction complete: {chrom_dir}")
 
     def browse_csv_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select chromatogram CSV folder")
         if folder:
             self.csv_folder_edit.setText(folder)
+            self.labplot_folder_edit.setText(folder)
+            self.labplot_output_edit.setText(os.path.join(folder, "Waters_LabPlot_Project.lml"))
             self.refresh_integration_preview_files()
 
     def add_target(self):
@@ -1558,6 +1777,9 @@ class MassLynxWindow(QMainWindow):
             QMessageBox.warning(self, "No CSVs", "No chromatogram CSVs were found.")
             return
 
+        target_summary = ", ".join(f"{c:.3f}m (-{tm:.3f},+{tp:.3f})" for c, tm, tp in self.targets)
+        console_log(f"Starting peak integration in: {csv_folder} ({len(files)} CSVs, targets: [{target_summary}])", category="UI-INTEGRATE")
+
         headers = ["Sample"] + [f"{center:.3f} min" for center, _, _ in self.targets]
         rows = []
         processed = 0
@@ -1574,9 +1796,13 @@ class MassLynxWindow(QMainWindow):
                     name = sample_name
                     if len(channels) > 1:
                         name = f"{sample_name}_{channel_name.replace(' ', '')}"
-                    rows.append({"Sample": name, **{header: f"{area:.6g}" for header, area in zip(headers[1:], areas)}})
+                    area_strs = [f"{area:.6g}" for area in areas]
+                    rows.append({"Sample": name, **{header: val for header, val in zip(headers[1:], area_strs)}})
+                    area_log = ", ".join(f"{c:.3f}m={a:.4g}" for (c, _, _), a in zip(self.targets, areas))
+                    console_log(f"Integrated '{name}': {area_log}", category="UI-INTEGRATE")
                 processed += 1
-            except Exception:
+            except Exception as exc:
+                console_log(f"Integration error for '{sample_name}': {exc}", category="UI-INTEGRATE", level="WARN")
                 rows.append({"Sample": sample_name, **{header: "0" for header in headers[1:]}})
 
         output_path = os.path.join(csv_folder, "00_evaluated_data.csv")
@@ -1585,12 +1811,23 @@ class MassLynxWindow(QMainWindow):
                 writer = csv.DictWriter(output_file, fieldnames=headers)
                 writer.writeheader()
                 writer.writerows(rows)
+            console_log(f"Saved evaluation summary to: {output_path} ({len(rows)} sample/channel rows, {len(self.targets)} targets)", category="UI-INTEGRATE")
         except OSError as exc:
+            console_log(f"Write failed for {output_path}: {exc}", category="UI-INTEGRATE", level="ERROR")
             QMessageBox.critical(self, "Write failed", str(exc))
             return
         QMessageBox.information(self, "Integration complete", f"Integrated {processed} file(s).\nSaved to:\n{output_path}")
         self.statusBar().showMessage(f"Integration complete: {processed}/{len(files)} files")
 
+    def open_folder_in_explorer(self, folder_path: str):
+        if not folder_path or not os.path.exists(folder_path):
+            QMessageBox.information(
+                self,
+                "Directory not found",
+                f"The directory does not exist yet:\n{folder_path}",
+            )
+            return
+        open_in_explorer(folder_path)
     def browse_plot_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder with chromatogram CSVs")
         if folder:
@@ -1916,6 +2153,11 @@ class MassLynxWindow(QMainWindow):
         if not 72 <= dpi <= 2400:
             raise ValueError("Export DPI must be between 72 and 2400.")
         self.figure.savefig(filename, format=extension[1:], bbox_inches="tight", dpi=dpi)
+
+
+# ---------------------------
+# Run
+# ---------------------------
 
 
 # ---------------------------
