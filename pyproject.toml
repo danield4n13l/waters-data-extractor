@@ -37,6 +37,7 @@ classifiers = [
 dependencies = [
     "pandas>=1.5.0",
     "matplotlib>=3.5.0",
+    "PySide6>=6.5.0",
     "rainbow-api[waters]>=0.1.0",
 ]
 
