@@ -1316,6 +1316,7 @@ class MassLynxWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.csv_preview_splitter = splitter
         controls = QWidget()
+        self.csv_preview_controls_panel = controls
         controls.setMinimumWidth(220)
         controls.setMaximumWidth(380)
         controls_layout = QFormLayout(controls)
@@ -1331,7 +1332,8 @@ class MassLynxWindow(QMainWindow):
         folder_row.addWidget(browse)
         controls_layout.addRow("Folder", folder_row)
 
-        self.plot_file_table = QTableWidget(0, 3)
+        self.plot_file_table = QTableWidget(0, 2)
+        self.plot_file_table.setColumnCount(3)
         self.plot_file_table.setHorizontalHeaderLabels(["CSV file", "Type", "Subfolder"])
         self.plot_file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.plot_file_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -1348,6 +1350,20 @@ class MassLynxWindow(QMainWindow):
         self.plot_signal_combo = QComboBox()
         self.plot_signal_combo.currentIndexChanged.connect(self.update_plot)
         controls_layout.addRow("Signal", self.plot_signal_combo)
+        self.plot_mz_axis_label = QLabel("m/z x-axis")
+        self.plot_mz_axis_combo = QComboBox()
+        self.plot_mz_axis_combo.addItem("Retention time", "rt")
+        self.plot_mz_axis_combo.addItem("m/z values", "mz")
+        self.plot_mz_axis_combo.currentIndexChanged.connect(self.update_plot)
+        controls_layout.addRow(self.plot_mz_axis_label, self.plot_mz_axis_combo)
+        self.plot_mz_scan_label = QLabel("RT scan")
+        self.plot_mz_scan_combo = QComboBox()
+        self.plot_mz_scan_combo.currentIndexChanged.connect(self.update_plot)
+        controls_layout.addRow(self.plot_mz_scan_label, self.plot_mz_scan_combo)
+        self.plot_mz_axis_label.setVisible(False)
+        self.plot_mz_axis_combo.setVisible(False)
+        self.plot_mz_scan_label.setVisible(False)
+        self.plot_mz_scan_combo.setVisible(False)
         self.plot_all_checkbox = QCheckBox("Show all signals")
         self.plot_all_checkbox.toggled.connect(self.update_plot)
         controls_layout.addRow("Overlay", self.plot_all_checkbox)
@@ -1363,6 +1379,7 @@ class MassLynxWindow(QMainWindow):
 
         self.preview_tabs = QTabWidget()
         plot_panel = QWidget()
+        self.csv_preview_graph_panel = plot_panel
         plot_layout = QVBoxLayout(plot_panel)
         plot_layout.setContentsMargins(0, 0, 0, 0)
         self.plot_canvas = FigureCanvasQTAgg(self.figure)
@@ -1618,32 +1635,71 @@ class MassLynxWindow(QMainWindow):
             self.plot_file_table.selectRow(0)
     def load_plot_csv(self, *_args):
         selected_rows = self.plot_file_table.selectionModel().selectedRows()
-        if not selected_rows:
+        path = None
+        if selected_rows:
+            item = self.plot_file_table.item(selected_rows[0].row(), 0)
+            path = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not path:
+            self.plot_dataframe = None
+            self.plot_csv_type = "CSV"
+            self.csv_preview_table.clear()
+            self.csv_preview_table.setRowCount(0)
+            self.csv_preview_table.setColumnCount(0)
+            self.csv_preview_status.setText("Select a CSV file to inspect its rows.")
+            self.update_plot()
             return
-        row = selected_rows[0].row()
-        item = self.plot_file_table.item(row, 0)
-        type_item = self.plot_file_table.item(row, 1)
-        if not item:
-            return
-        path = item.data(Qt.ItemDataRole.UserRole)
-        self.current_csv_path = path
-        self.plot_csv_type = type_item.text() if type_item else "CSV"
         try:
             frame = pd.read_csv(path)
         except Exception as exc:
-            self.plot_status_label.setText(f"Failed to load CSV: {exc}")
-            self.csv_preview_status.setText(f"Could not load preview: {exc}")
+            self.plot_dataframe = None
+            self.plot_csv_type = "CSV"
+            self.csv_preview_table.clear()
+            self.csv_preview_table.setRowCount(0)
+            self.csv_preview_table.setColumnCount(0)
+            self.csv_preview_status.setText("No table preview available for this file.")
+            self.plot_status_label.setText(f"Could not read CSV: {exc}")
+            self.update_plot()
             return
-        self.current_frame = frame
-        self.populate_csv_preview(frame)
-        rt_column = find_rt_column(frame)
-        signal_columns = [column for column in frame.columns if column != rt_column]
+        self.plot_dataframe = frame
+        type_item = self.plot_file_table.item(selected_rows[0].row(), 1)
+        self.plot_csv_type = classify_csv_type(path, frame.columns)
+        if type_item is not None:
+            type_item.setText(self.plot_csv_type)
+        if self.plot_csv_type == "Integrated areas":
+            sample_column = next(
+                (column for column in frame.columns if str(column).strip().casefold() == "sample"),
+                frame.columns[0] if len(frame.columns) else None,
+            )
+            signal_columns = [column for column in frame.columns if column != sample_column]
+        else:
+            rt_column = find_rt_column(frame) if len(frame.columns) else None
+            signal_columns = [column for column in frame.columns if column != rt_column]
         self.plot_signal_combo.blockSignals(True)
         self.plot_signal_combo.clear()
-        for column in signal_columns:
-            self.plot_signal_combo.addItem(str(column))
+        self.plot_signal_combo.addItems([str(column) for column in signal_columns])
         self.plot_signal_combo.blockSignals(False)
+        self.plot_signal_combo.setEnabled(True)
+        self.plot_all_checkbox.setEnabled(True)
+
+        is_mz = self.plot_csv_type == "m/z"
+        self.plot_mz_axis_label.setVisible(is_mz)
+        self.plot_mz_axis_combo.setVisible(is_mz)
+        self.plot_mz_scan_label.setVisible(is_mz)
+        self.plot_mz_scan_combo.setVisible(is_mz)
+        self.plot_mz_axis_combo.blockSignals(True)
+        self.plot_mz_scan_combo.blockSignals(True)
+        self.plot_mz_scan_combo.clear()
+        if is_mz and len(frame.columns):
+            rt_column = find_rt_column(frame)
+            for row_index, rt_value in enumerate(pd.to_numeric(frame[rt_column], errors="coerce")):
+                if pd.notna(rt_value):
+                    self.plot_mz_scan_combo.addItem(f"{rt_value:g} min", row_index)
+            self.plot_mz_axis_combo.setCurrentIndex(self.plot_mz_axis_combo.findData("rt"))
+        self.plot_mz_scan_combo.blockSignals(False)
+        self.plot_mz_axis_combo.blockSignals(False)
+        self.populate_csv_preview(frame)
         self.update_plot()
+
     def populate_csv_preview(self, frame: pd.DataFrame):
         max_preview_rows = 200
         max_preview_columns = 60
@@ -1667,10 +1723,131 @@ class MassLynxWindow(QMainWindow):
             self.csv_preview_status.setText(f"{len(frame)} rows x {len(frame.columns)} columns")
 
     def update_plot(self, *_args):
-        if self.current_frame is None:
-            return
-        frame = self.current_frame
         self.axes.clear()
+        frame = self.plot_dataframe
+        if frame is None or frame.empty or len(frame.columns) < 2:
+            self.axes.set_title("CSV data preview")
+            self.plot_canvas.draw_idle()
+            return
+
+        if self.plot_csv_type == "Integrated areas":
+            sample_column = next(
+                (column for column in frame.columns if str(column).strip().casefold() == "sample"),
+                frame.columns[0],
+            )
+            area_columns = [column for column in frame.columns if column != sample_column]
+            selected = area_columns if self.plot_all_checkbox.isChecked() else [self.plot_signal_combo.currentText()]
+            selected = [column for column in selected if column in area_columns]
+            labels = frame[sample_column].fillna("").astype(str).tolist()
+            positions = list(range(len(labels)))
+            width = 0.8 / max(len(selected), 1)
+            for series_index, column in enumerate(selected):
+                values = pd.to_numeric(frame[column], errors="coerce").fillna(0).tolist()
+                offset = (series_index - (len(selected) - 1) / 2) * width
+                self.axes.bar(
+                    [position + offset for position in positions],
+                    values,
+                    width=width,
+                    label=str(column),
+                )
+            tick_stride = max(1, len(labels) // 40)
+            tick_positions = positions[::tick_stride]
+            self.axes.set_xticks(tick_positions, [labels[index] for index in tick_positions], rotation=60, ha="right")
+            self.axes.set_xlabel("Sample file")
+            self.axes.set_ylabel("Integrated area")
+            self.axes.set_title(self.current_plot_title())
+            self.axes.grid(True, axis="y", alpha=0.3)
+            if len(selected) > 1:
+                self.axes.legend(loc="best")
+            self.plot_status_label.setText(
+                f"Showing {len(selected)} integrated area series across {len(labels)} samples."
+            )
+            self.plot_canvas.draw_idle()
+            return
+
+        if self.plot_csv_type == "m/z":
+            rt_column = find_rt_column(frame)
+            mass_columns = []
+            for column in frame.columns:
+                if column == rt_column:
+                    continue
+                try:
+                    mass_columns.append((column, float(str(column).strip())))
+                except ValueError:
+                    continue
+            if not mass_columns:
+                self.plot_status_label.setText("No numeric m/z columns are available.")
+                self.plot_canvas.draw_idle()
+                return
+
+            x_mode = self.plot_mz_axis_combo.currentData() or "rt"
+            self.plot_signal_combo.setEnabled(x_mode == "rt")
+            self.plot_all_checkbox.setEnabled(x_mode == "rt")
+            self.axes.set_ylabel("Ion intensity")
+            self.axes.set_title(self.current_plot_title())
+            if x_mode == "mz":
+                scan_index = self.plot_mz_scan_combo.currentData()
+                if scan_index is None:
+                    scan_index = 0
+                scan_index = int(scan_index)
+                masses = [mass for _, mass in mass_columns]
+                values = [
+                    pd.to_numeric(pd.Series([frame.iloc[scan_index][column]]), errors="coerce").iloc[0]
+                    for column, _ in mass_columns
+                ]
+                spacing = min(
+                    (abs(right - left) for left, right in zip(masses, masses[1:]) if right != left),
+                    default=1.0,
+                )
+                self.axes.bar(masses, values, width=spacing * 0.8)
+                rt_value = frame.iloc[scan_index][rt_column]
+                self.axes.set_xlabel("m/z")
+                self.axes.set_title(f"{self.current_plot_title()} at RT {rt_value:g} min")
+                self.axes.grid(True, axis="y", alpha=0.3)
+                self.plot_status_label.setText(
+                    f"Mass spectrum at RT {rt_value:g} min | {len(masses)} m/z bins"
+                )
+            else:
+                signal_columns = [column for column, _ in mass_columns]
+                selected_columns = (
+                    signal_columns
+                    if self.plot_all_checkbox.isChecked()
+                    else [self.plot_signal_combo.currentText()]
+                )
+                selected_columns = [column for column in selected_columns if column in signal_columns]
+                x_values = pd.to_numeric(frame[rt_column], errors="coerce")
+                step = min(
+                    (abs(right - left) for left, right in zip(
+                        sorted(x_values.dropna().unique()),
+                        sorted(x_values.dropna().unique())[1:],
+                    ) if right != left),
+                    default=1.0,
+                )
+                group_width = min(step * 0.8, 0.8) / max(len(selected_columns), 1)
+                plotted = 0
+                for signal_index, column in enumerate(selected_columns):
+                    y_values = pd.to_numeric(frame[column], errors="coerce")
+                    valid = x_values.notna() & y_values.notna()
+                    if not valid.any():
+                        continue
+                    offset = (signal_index - (len(selected_columns) - 1) / 2) * group_width
+                    self.axes.bar(
+                        x_values[valid] + offset,
+                        y_values[valid],
+                        width=group_width,
+                        label=str(column),
+                    )
+                    plotted += 1
+                self.axes.set_xlabel("Retention time (min)")
+                self.axes.grid(True, axis="y", alpha=0.3)
+                self.plot_status_label.setText(
+                    f"Showing {plotted} m/z bar series; legend hidden for readability."
+                    if self.plot_all_checkbox.isChecked()
+                    else f"Showing m/z {self.plot_signal_combo.currentText()} over retention time."
+                )
+            self.plot_canvas.draw_idle()
+            return
+
         rt_column = find_rt_column(frame)
         signal_columns = [column for column in frame.columns if column != rt_column]
         selected = signal_columns if self.plot_all_checkbox.isChecked() else [self.plot_signal_combo.currentText()]
@@ -1685,17 +1862,28 @@ class MassLynxWindow(QMainWindow):
                 self.axes.plot(x_values[valid], y_values[valid], label=str(column), linewidth=1.5)
                 plotted += 1
         self.axes.set_xlabel(str(rt_column))
-        self.axes.set_ylabel("Signal")
+        if self.plot_csv_type == "DAD":
+            self.axes.set_ylabel("Absorbance (AU)")
+        elif self.plot_csv_type == "TIC":
+            self.axes.set_ylabel("Total ion current")
+        elif self.plot_csv_type == "m/z":
+            self.axes.set_ylabel("Ion intensity")
+        else:
+            self.axes.set_ylabel("Signal")
         self.axes.set_title(self.current_plot_title())
         self.axes.grid(True, alpha=0.3)
-        if plotted > 1:
+        hide_mz_legend = self.plot_csv_type == "m/z" and self.plot_all_checkbox.isChecked() and plotted > 1
+        if plotted > 1 and not hide_mz_legend:
             self.axes.legend(loc="best")
         if plotted == 0:
             status = "No numeric signal data available."
+        elif hide_mz_legend:
+            status = f"Showing {plotted} m/z traces; legend hidden for readability."
         else:
-            status = f"Showing {plotted} trace(s)."
+            status = f"Showing {plotted} {self.plot_csv_type} trace(s)."
         self.plot_status_label.setText(status)
         self.plot_canvas.draw_idle()
+
     def current_plot_title(self):
         selected_rows = self.plot_file_table.selectionModel().selectedRows()
         if not selected_rows:
