@@ -434,17 +434,53 @@ def read_chrom_csv_channels(path: str):
     return channels
 
 
-def find_chrom_csv_files(root: str) -> List[tuple]:
+def find_chrom_csv_files(root: str, include_evaluated: bool = False) -> List[tuple]:
     """Find chromatogram CSVs recursively, retaining subfolders in sample names."""
     files = []
     for dirpath, _, filenames in os.walk(root):
         for filename in filenames:
-            if filename.lower().endswith(".csv") and filename.lower() != "00_evaluated_data.csv":
+            if filename.lower().endswith(".csv") and (
+                include_evaluated or filename.lower() != "00_evaluated_data.csv"
+            ):
                 path = os.path.join(dirpath, filename)
                 relative = os.path.relpath(path, root)
                 sample_name = os.path.splitext(relative)[0]
                 files.append((sample_name, path))
     return sorted(files, key=lambda item: item[0].casefold())
+
+
+def classify_csv_type(path: str, headers=None) -> str:
+    """Identify MassLynx DAD, TIC, and m/z CSVs from names and headers."""
+    filename = os.path.basename(path).casefold()
+    if filename == "00_evaluated_data.csv":
+        return "Integrated areas"
+    path_parts = {part.casefold() for part in path.replace("\\", "/").split("/")}
+    if filename.endswith("_mz.csv") or "mz" in path_parts or "m/z" in path_parts:
+        return "m/z"
+    if filename.endswith("_tic.csv") or "tic" in path_parts:
+        return "TIC"
+
+    if headers is None:
+        try:
+            with open(path, "r", newline="", encoding="utf-8-sig") as source:
+                headers = next(csv.reader(source), [])
+        except (OSError, UnicodeError, csv.Error):
+            headers = []
+    normalized_headers = [str(header).strip().casefold() for header in headers]
+    if any(header in {"tic", "total ion current"} for header in normalized_headers):
+        return "TIC"
+    if filename.endswith("_nm.csv") or any(
+        header == "absorbance" or re.fullmatch(r"\d+(?:\.\d+)?\s*nm", header)
+        for header in normalized_headers
+    ):
+        return "DAD"
+    numeric_signals = sum(
+        bool(re.fullmatch(r"\d+(?:\.\d+)?", header))
+        for header in normalized_headers[1:]
+    )
+    if numeric_signals >= 2:
+        return "m/z"
+    return "CSV"
 
 
 def moving_average(seq, window=5):
@@ -1295,8 +1331,8 @@ class MassLynxWindow(QMainWindow):
         folder_row.addWidget(browse)
         controls_layout.addRow("Folder", folder_row)
 
-        self.plot_file_table = QTableWidget(0, 2)
-        self.plot_file_table.setHorizontalHeaderLabels(["CSV file", "Subfolder"])
+        self.plot_file_table = QTableWidget(0, 3)
+        self.plot_file_table.setHorizontalHeaderLabels(["CSV file", "Type", "Subfolder"])
         self.plot_file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.plot_file_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.plot_file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1306,6 +1342,7 @@ class MassLynxWindow(QMainWindow):
         self.plot_file_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.plot_file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.plot_file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.plot_file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.plot_file_table.itemSelectionChanged.connect(self.load_plot_csv)
         controls_layout.addRow("CSV files", self.plot_file_table)
         self.plot_signal_combo = QComboBox()
@@ -1324,6 +1361,7 @@ class MassLynxWindow(QMainWindow):
         self.plot_status_label.setWordWrap(True)
         controls_layout.addRow(self.plot_status_label)
 
+        self.preview_tabs = QTabWidget()
         plot_panel = QWidget()
         plot_layout = QVBoxLayout(plot_panel)
         plot_layout.setContentsMargins(0, 0, 0, 0)
@@ -1333,9 +1371,25 @@ class MassLynxWindow(QMainWindow):
         self.plot_controls_checkbox.toggled.connect(self.plot_toolbar.setVisible)
         plot_layout.addWidget(self.plot_toolbar)
         plot_layout.addWidget(self.plot_canvas)
+        self.preview_tabs.addTab(plot_panel, "Plot preview")
+
+        table_panel = QWidget()
+        table_layout = QVBoxLayout(table_panel)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        self.csv_preview_table = QTableWidget(0, 0)
+        self.csv_preview_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.csv_preview_table.setAlternatingRowColors(True)
+        self.csv_preview_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.csv_preview_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.csv_preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.csv_preview_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table_layout.addWidget(self.csv_preview_table)
+        self.csv_preview_status = QLabel("Select a CSV file to inspect its rows.")
+        table_layout.addWidget(self.csv_preview_status)
+        self.preview_tabs.addTab(table_panel, "Table preview")
 
         splitter.addWidget(controls)
-        splitter.addWidget(plot_panel)
+        splitter.addWidget(self.preview_tabs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setHandleWidth(10)
@@ -1546,16 +1600,19 @@ class MassLynxWindow(QMainWindow):
             self.plot_status_label.setText("Select a valid folder to inspect CSV files.")
             return
 
-        files = find_chrom_csv_files(folder)
+        files = find_chrom_csv_files(folder, include_evaluated=True)
         self.plot_file_table.setRowCount(len(files))
         for row, (sample_name, path) in enumerate(files):
             relative_dir = os.path.relpath(os.path.dirname(path), folder)
             subfolder = "(root)" if relative_dir in {"", "."} else relative_dir
+            csv_type = classify_csv_type(path)
             filename_item = QTableWidgetItem(os.path.basename(path))
             filename_item.setData(Qt.ItemDataRole.UserRole, path)
+            type_item = QTableWidgetItem(csv_type)
             subfolder_item = QTableWidgetItem(subfolder)
             self.plot_file_table.setItem(row, 0, filename_item)
-            self.plot_file_table.setItem(row, 1, subfolder_item)
+            self.plot_file_table.setItem(row, 1, type_item)
+            self.plot_file_table.setItem(row, 2, subfolder_item)
         self.plot_status_label.setText(f"Found {len(files)} CSV file(s).")
         if files:
             self.plot_file_table.selectRow(0)
@@ -1565,16 +1622,20 @@ class MassLynxWindow(QMainWindow):
             return
         row = selected_rows[0].row()
         item = self.plot_file_table.item(row, 0)
+        type_item = self.plot_file_table.item(row, 1)
         if not item:
             return
         path = item.data(Qt.ItemDataRole.UserRole)
         self.current_csv_path = path
+        self.plot_csv_type = type_item.text() if type_item else "CSV"
         try:
             frame = pd.read_csv(path)
         except Exception as exc:
             self.plot_status_label.setText(f"Failed to load CSV: {exc}")
+            self.csv_preview_status.setText(f"Could not load preview: {exc}")
             return
         self.current_frame = frame
+        self.populate_csv_preview(frame)
         rt_column = find_rt_column(frame)
         signal_columns = [column for column in frame.columns if column != rt_column]
         self.plot_signal_combo.blockSignals(True)
@@ -1583,6 +1644,28 @@ class MassLynxWindow(QMainWindow):
             self.plot_signal_combo.addItem(str(column))
         self.plot_signal_combo.blockSignals(False)
         self.update_plot()
+    def populate_csv_preview(self, frame: pd.DataFrame):
+        max_preview_rows = 200
+        max_preview_columns = 60
+        preview = frame.iloc[:max_preview_rows, :max_preview_columns]
+        self.csv_preview_table.clear()
+        self.csv_preview_table.setRowCount(len(preview))
+        self.csv_preview_table.setColumnCount(len(preview.columns))
+        self.csv_preview_table.setHorizontalHeaderLabels([str(column) for column in preview.columns])
+        self.csv_preview_table.setColumnWidth(0, 150)
+        for row_index, row in enumerate(preview.itertuples(index=False, name=None)):
+            for column_index, value in enumerate(row):
+                text = "" if pd.isna(value) else str(value)
+                self.csv_preview_table.setItem(row_index, column_index, QTableWidgetItem(text))
+        truncated = len(frame) > max_preview_rows or len(frame.columns) > max_preview_columns
+        if truncated:
+            self.csv_preview_status.setText(
+                f"Showing {len(preview)} of {len(frame)} rows and "
+                f"{len(preview.columns)} of {len(frame.columns)} columns."
+            )
+        else:
+            self.csv_preview_status.setText(f"{len(frame)} rows x {len(frame.columns)} columns")
+
     def update_plot(self, *_args):
         if self.current_frame is None:
             return
