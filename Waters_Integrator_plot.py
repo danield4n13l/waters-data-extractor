@@ -776,7 +776,7 @@ try:
     )
 except ImportError:
     try:
-        from Waters_LabPlot_Exporter import (
+        from Waters_Integrator_exporter import (
             create_labplot_project,
             export_labplot_script,
             generate_labplot_lml_project,
@@ -798,7 +798,7 @@ except ImportError:
                 LabPlotExporterWindow,
             )
         except ImportError:
-            from Waters_LabPlot_Exporter import (
+            from Waters_Integrator_exporter import (
                 create_labplot_project,
                 export_labplot_script,
                 generate_labplot_lml_project,
