@@ -637,6 +637,7 @@ class MassLynxWindow(QMainWindow):
         mode_index = self.theme_mode_combo.findData(self.settings.value("theme/mode", "system"))
         self.theme_mode_combo.setCurrentIndex(max(mode_index, 0))
         appearance.addWidget(self.theme_mode_combo)
+        self._build_template_menu(appearance)
 
         header = QHBoxLayout()
         header.addLayout(heading, 1)
@@ -657,6 +658,7 @@ class MassLynxWindow(QMainWindow):
         self.theme_mode_combo.currentIndexChanged.connect(self.apply_theme)
         QApplication.styleHints().colorSchemeChanged.connect(self.apply_theme)
         self.apply_theme()
+
     def apply_theme(self, *_args):
         app = QApplication.instance()
         mode = self.theme_mode_combo.currentData() or "system"
@@ -859,6 +861,15 @@ class MassLynxWindow(QMainWindow):
         add_target_button.setObjectName("secondaryButton")
         add_target_button.clicked.connect(self.add_target)
         target_form.addWidget(add_target_button, 1, 3)
+        target_form.addWidget(QLabel("Recent targets"), 2, 0)
+        self.recent_target_combo = QComboBox()
+        self.recent_target_combo.addItem("Select a saved target", None)
+        self.refresh_recent_targets()
+        target_form.addWidget(self.recent_target_combo, 2, 1, 1, 2)
+        use_recent = QPushButton("Use selected")
+        use_recent.setObjectName("secondaryButton")
+        use_recent.clicked.connect(self.load_recent_target)
+        target_form.addWidget(use_recent, 2, 3)
         target_layout.addLayout(target_form)
 
         target_row = QHBoxLayout()
@@ -880,6 +891,146 @@ class MassLynxWindow(QMainWindow):
         target_row.addLayout(target_actions)
         target_layout.addLayout(target_row)
         section.body_layout.addWidget(target_panel)
+    def _build_template_menu(self, parent_layout):
+        self.template_button = QToolButton()
+        self.template_button.setText("Templates")
+        self.template_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.template_menu = QMenu(self.template_button)
+        template_panel = QFrame()
+        template_panel.setObjectName("templatePopup")
+        template_panel.setMinimumWidth(360)
+        template_layout = QVBoxLayout(template_panel)
+        template_layout.setContentsMargins(12, 12, 12, 12)
+        template_layout.setSpacing(8)
+        template_heading = QLabel("Option templates")
+        template_heading.setObjectName("templatePopupHeading")
+        template_layout.addWidget(template_heading)
+
+        self.template_name_edit = QLineEdit()
+        self.template_name_edit.setPlaceholderText("Template name")
+        self.template_combo = QComboBox()
+        template_layout.addWidget(self.template_name_edit)
+        template_layout.addWidget(self.template_combo)
+
+        actions = QHBoxLayout()
+        save_button = QPushButton("Save current options")
+        save_button.clicked.connect(self.save_template)
+        load_button = QPushButton("Load selected")
+        load_button.setObjectName("secondaryButton")
+        load_button.clicked.connect(self.load_template)
+        delete_button = QPushButton("Delete selected")
+        delete_button.setObjectName("secondaryButton")
+        delete_button.clicked.connect(self.delete_template)
+        actions.addWidget(save_button)
+        actions.addWidget(load_button)
+        actions.addWidget(delete_button)
+        template_layout.addLayout(actions)
+        template_action = QWidgetAction(self.template_menu)
+        template_action.setDefaultWidget(template_panel)
+        self.template_menu.addAction(template_action)
+        self.template_button.setMenu(self.template_menu)
+        parent_layout.addWidget(self.template_button)
+        self.refresh_template_combo()
+
+    def refresh_recent_targets(self):
+        self.recent_target_combo.blockSignals(True)
+        self.recent_target_combo.clear()
+        self.recent_target_combo.addItem("Select a saved target", None)
+        for target in self.recent_targets:
+            if not isinstance(target, list) or len(target) != 3:
+                continue
+            center, tol_minus, tol_plus = target
+            label = f"{center:g} min  (-{tol_minus:g}, +{tol_plus:g})"
+            self.recent_target_combo.addItem(label, target)
+        self.recent_target_combo.setCurrentIndex(0)
+        self.recent_target_combo.blockSignals(False)
+
+    def remember_recent_target(self, target):
+        normalized = [float(value) for value in target]
+        self.recent_targets = [
+            previous for previous in self.recent_targets
+            if [float(value) for value in previous] != normalized
+        ]
+        self.recent_targets.insert(0, normalized)
+        self.recent_targets = self.recent_targets[:20]
+        self.settings.setValue("recentTargets", json.dumps(self.recent_targets))
+        self.refresh_recent_targets()
+
+    def load_recent_target(self):
+        target = self.recent_target_combo.currentData()
+        if not target:
+            return
+        self.center_edit.setText(f"{float(target[0]):g}")
+        self.tol_minus_edit.setText(f"{float(target[1]):g}")
+        self.tol_plus_edit.setText(f"{float(target[2]):g}")
+
+    def refresh_template_combo(self, selected_name=None):
+        self.template_combo.blockSignals(True)
+        self.template_combo.clear()
+        self.template_combo.addItems(sorted(self.templates, key=str.casefold))
+        if selected_name:
+            index = self.template_combo.findText(selected_name)
+            if index >= 0:
+                self.template_combo.setCurrentIndex(index)
+        self.template_combo.blockSignals(False)
+
+    def save_template(self):
+        name = self.template_name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Template name required", "Enter a name for these options.")
+            return
+        self.templates[name] = {
+            "raw_root": self.raw_root_edit.text().strip(),
+            "merge_wavelengths": self.merge_wavelengths_edit.text(),
+            "folder_rules": self.group_rules_edit.toPlainText(),
+            "match_mode": self.current_match_mode(),
+            "csv_folder": self.csv_folder_edit.text().strip(),
+            "targets": [list(target) for target in self.targets],
+        }
+        self.settings.setValue("templates", json.dumps(self.templates, ensure_ascii=False))
+        self.refresh_template_combo(name)
+        self.statusBar().showMessage(f"Saved template: {name}")
+
+    def load_template(self):
+        name = self.template_combo.currentText()
+        template = self.templates.get(name)
+        if not template:
+            QMessageBox.warning(self, "No template selected", "Choose a saved template first.")
+            return
+        self.raw_root_edit.setText(template.get("raw_root", ""))
+        self.merge_wavelengths_edit.setText(template.get("merge_wavelengths", ""))
+        self.group_rules_edit.setPlainText(template.get("folder_rules", ""))
+        self.regex_radio.setChecked(template.get("match_mode", "Regex") == "Regex")
+        self.wildcard_radio.setChecked(template.get("match_mode", "Regex") != "Regex")
+        self.csv_folder_edit.setText(template.get("csv_folder", ""))
+
+        self.targets = []
+        self.target_table.setRowCount(0)
+        for target in template.get("targets", []):
+            if not isinstance(target, (list, tuple)) or len(target) != 3:
+                continue
+            values = tuple(float(value) for value in target)
+            self.targets.append(values)
+            row = self.target_table.rowCount()
+            self.target_table.insertRow(row)
+            for column, value in enumerate(values):
+                self.target_table.setItem(row, column, QTableWidgetItem(f"{value:.3f}"))
+        self.plot_folder_edit.setText(self.csv_folder_edit.text())
+        if os.path.isdir(self.raw_root_edit.text()):
+            self.refresh_raw_preview()
+        self.refresh_plot_files()
+        self.refresh_integration_preview_files()
+        self.statusBar().showMessage(f"Loaded template: {name}")
+
+    def delete_template(self):
+        name = self.template_combo.currentText()
+        if name not in self.templates:
+            return
+        del self.templates[name]
+        self.settings.setValue("templates", json.dumps(self.templates, ensure_ascii=False))
+        self.refresh_template_combo()
+        self.statusBar().showMessage(f"Deleted template: {name}")
+
     def _build_plot_section(self, parent_layout):
         section = CollapsibleSection("03  CSV data preview", expanded=False)
         parent_layout.addWidget(section)
@@ -1095,6 +1246,9 @@ class MassLynxWindow(QMainWindow):
         if not targets:
             QMessageBox.critical(self, "Missing targets", "Define at least one valid integration target.")
             return
+
+        for target in targets:
+            self.remember_recent_target(target)
 
         csv_files = find_chrom_csv_files(folder)
         if not csv_files:
