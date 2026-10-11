@@ -16,6 +16,8 @@ If you are the original author of the project and would like to be credited, ple
 > [!NOTE]
 > This codebase is heavily authoured by Google Antigravity, using Gemini 3.8 Flash on high priority, and as such, may have bugs or issues.
 
+<!-- -->
+
 > [!WARNING]
 > **Please note that the code is currently work in progress and may not be fully functional**
 
@@ -81,15 +83,18 @@ When you extract a folder containing MassLynx runs, the application creates a st
 ## Installation
 
 ### 1. Prerequisites
+
 - Python 3.8 or higher.
 
 ### 2. Clone Repository
+
 ```bash
 git clone https://github.com/<your-username>/waters-data-extractor.git
 cd waters-data-extractor
 ```
 
 ### 3. Create a Virtual Environment (Recommended)
+
 ```bash
 python -m venv venv
 
@@ -101,6 +106,7 @@ source venv/bin/activate
 ```
 
 ### 4. Install Dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -179,6 +185,7 @@ python Waters_Integrator_exporter.py -i path/to/csvs -o Project.vsz --link-csv
 ## Integration Algorithm Details
 
 For each target peak in window $[t_{\text{target}} - \text{tol}_-, t_{\text{target}} + \text{tol}_+]$:
+
 1. **Apex Detection**: Identifies local maximum after moving average smoothing (default window = 5 points).
 2. **Peak Bounds**: Finds surrounding local minima $(x_0, y_0)$ and $(x_1, y_1)$ to the left and right of the apex.
 3. **Baseline Subtraction**: Constructs a linear baseline between the boundaries:
