@@ -1,0 +1,6 @@
+# Core data analysis and visualization
+pandas>=1.5.0
+matplotlib>=3.5.0
+
+# Waters MassLynx parsing library
+rainbow-api[waters]>=0.1.0

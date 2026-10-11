@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "waters-data-extractor"
+version = "0.1.0"
+description = "Extract, integrate, and visualize Waters MassLynx chromatographic and mass spectrometry data."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "waters-data-extractor contributors" }
+]
+keywords = [
+    "waters",
+    "masslynx",
+    "chromatography",
+    "mass-spectrometry",
+    "peak-integration",
+    "uv-vis",
+    "tic",
+    "lc-ms"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "pandas>=1.5.0",
+    "matplotlib>=3.5.0",
+    "rainbow-api[waters]>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
