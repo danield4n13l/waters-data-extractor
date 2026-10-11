@@ -13,6 +13,12 @@ This project was originally made by a third-party, however, it has been modified
 
 If you are the original author of the project and would like to be credited, please let me know.
 
+> [!NOTE]
+> This codebase is heavily authoured by Google Antigravity, using Gemini 3.8 Flash on high priority, and as such, may have bugs or issues.
+
+> [!WARNING]
+> **Please note that the code is currently work in progress and may not be fully functional**
+
 ## Features
 
 - **Automated MassLynx `.raw` Data Extraction**:
@@ -150,7 +156,7 @@ python Waters_Integrator_plot.py
 
 ---
 
-### Standalone Veusz Exporter Tool
+### Standalone Exporter Tool
 
 Launch the dedicated export workspace:
 
