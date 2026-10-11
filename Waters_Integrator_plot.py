@@ -769,6 +769,58 @@ class MassLynxWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        narrow = self.width() < 900
+        if narrow == self._responsive_narrow:
+            return
+        self._responsive_narrow = narrow
+        if hasattr(self, "integration_splitter"):
+            self.integration_splitter.setOrientation(
+                Qt.Orientation.Vertical if narrow else Qt.Orientation.Horizontal
+            )
+            if narrow:
+                target_height = max(280, self.integration_target_panel.sizeHint().height())
+                preview_height = 360
+                self.integration_target_panel.setMinimumHeight(target_height)
+                self.integration_preview_panel.setMinimumHeight(preview_height)
+                self.integration_splitter.setMinimumHeight(
+                    target_height + preview_height + self.integration_splitter.handleWidth()
+                )
+                self.integration_splitter.setSizes([target_height, preview_height])
+            else:
+                self.integration_target_panel.setMinimumHeight(0)
+                self.integration_preview_panel.setMinimumHeight(0)
+                self.integration_splitter.setMinimumHeight(0)
+                self.integration_splitter.setSizes([680, 500])
+        if hasattr(self, "csv_preview_splitter"):
+            self.csv_preview_splitter.setOrientation(
+                Qt.Orientation.Vertical if narrow else Qt.Orientation.Horizontal
+            )
+            self.csv_preview_splitter.setMaximumWidth(16777215)
+            self.csv_preview_splitter.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding,
+            )
+            if narrow:
+                self.csv_preview_controls_panel.setMaximumWidth(16777215)
+                controls_height = max(500, self.csv_preview_controls_panel.sizeHint().height())
+                graph_height = 380
+                self.csv_preview_controls_panel.setMinimumHeight(controls_height)
+                self.csv_preview_graph_panel.setMinimumHeight(graph_height)
+                self.csv_preview_splitter.setMinimumHeight(
+                    controls_height + graph_height + self.csv_preview_splitter.handleWidth()
+                )
+                self.csv_preview_splitter.setSizes([controls_height, graph_height])
+            else:
+                self.csv_preview_controls_panel.setMaximumWidth(380)
+                self.csv_preview_controls_panel.setMinimumHeight(0)
+                self.csv_preview_graph_panel.setMinimumHeight(0)
+                self.csv_preview_splitter.setMinimumHeight(0)
+                self.csv_preview_splitter.setSizes([420, 850])
+        if hasattr(self, "integration_preview_controls_layout"):
+            self.integration_preview_controls_layout.setDirection(
+                QBoxLayout.Direction.TopToBottom if narrow else QBoxLayout.Direction.LeftToRight
+            )
+
     def _build_extraction_section(self, parent_layout):
         section = CollapsibleSection("01  Extraction and sample organization", expanded=True)
         parent_layout.addWidget(section)
@@ -844,7 +896,37 @@ class MassLynxWindow(QMainWindow):
         folder_row.addWidget(browse)
         section.body_layout.addLayout(folder_row)
 
+        preview_controls = QHBoxLayout()
+        self.integration_preview_controls_layout = preview_controls
+        self.integration_preview_toggle = QCheckBox("Open sample preview")
+        self.integration_preview_toggle.toggled.connect(self.set_integration_preview_visible)
+        self.integration_plot_controls = QCheckBox("Plot controls")
+        self.integration_preview_combo = QComboBox()
+        self.integration_preview_combo.currentIndexChanged.connect(self.update_integration_preview)
+        refresh_samples = QPushButton("Refresh samples")
+        refresh_samples.setObjectName("secondaryButton")
+        refresh_samples.clicked.connect(self.refresh_integration_preview_files)
+        preview_controls.addWidget(self.integration_preview_toggle)
+        preview_controls.addWidget(self.integration_plot_controls)
+        preview_controls.addWidget(QLabel("Sample"))
+        preview_controls.addWidget(self.integration_preview_combo, 1)
+        self.integration_mz_axis_combo = QComboBox()
+        self.integration_mz_axis_combo.addItem("RT", "rt")
+        self.integration_mz_axis_combo.addItem("m/z", "mz")
+        self.integration_mz_axis_combo.currentIndexChanged.connect(self.update_integration_preview)
+        self.integration_mz_scan_combo = QComboBox()
+        self.integration_mz_scan_combo.currentIndexChanged.connect(self.update_integration_preview)
+        self.integration_mz_axis_combo.setVisible(False)
+        self.integration_mz_scan_combo.setVisible(False)
+        preview_controls.addWidget(self.integration_mz_axis_combo)
+        preview_controls.addWidget(self.integration_mz_scan_combo)
+        preview_controls.addWidget(refresh_samples)
+        section.body_layout.addLayout(preview_controls)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.integration_splitter = splitter
         target_panel = QWidget()
+        self.integration_target_panel = target_panel
         target_layout = QVBoxLayout(target_panel)
         target_layout.setContentsMargins(0, 0, 0, 0)
         target_form = QGridLayout()
@@ -890,7 +972,167 @@ class MassLynxWindow(QMainWindow):
         target_actions.addWidget(run_integration)
         target_row.addLayout(target_actions)
         target_layout.addLayout(target_row)
-        section.body_layout.addWidget(target_panel)
+        splitter.addWidget(target_panel)
+
+        self.integration_preview_panel = QWidget()
+        integration_plot_layout = QVBoxLayout(self.integration_preview_panel)
+        integration_plot_layout.setContentsMargins(0, 0, 0, 0)
+        self.integration_preview_signal = QComboBox()
+        self.integration_preview_signal.currentIndexChanged.connect(self.update_integration_preview)
+        integration_plot_layout.addWidget(self.integration_preview_signal)
+        self.integration_figure = Figure(figsize=(5, 3.5), dpi=100, constrained_layout=True)
+        self.integration_axes = self.integration_figure.add_subplot(111)
+        self.integration_canvas = FigureCanvasQTAgg(self.integration_figure)
+        self.integration_toolbar = NavigationToolbar2QT(self.integration_canvas, self.integration_preview_panel)
+        self.integration_toolbar.setVisible(False)
+        self.integration_plot_controls.toggled.connect(self.integration_toolbar.setVisible)
+        integration_plot_layout.addWidget(self.integration_toolbar)
+        integration_plot_layout.addWidget(self.integration_canvas, 1)
+        self.integration_preview_status = QLabel("Choose a sample to preview its integration window.")
+        self.integration_preview_status.setWordWrap(True)
+        integration_plot_layout.addWidget(self.integration_preview_status)
+        self.integration_preview_panel.setMinimumWidth(260)
+        self.integration_preview_panel.setVisible(False)
+        splitter.addWidget(self.integration_preview_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setHandleWidth(8)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setSizes([300, 360])
+        section.body_layout.addWidget(splitter, 1)
+
+    def set_integration_preview_visible(self, visible: bool):
+        self.integration_preview_panel.setVisible(visible)
+        if visible:
+            if self.integration_preview_combo.count() == 0:
+                self.refresh_integration_preview_files()
+            else:
+                self.update_integration_preview()
+
+    def refresh_integration_preview_files(self):
+        folder = self.csv_folder_edit.text().strip()
+        files = find_chrom_csv_files(folder) if os.path.isdir(folder) else []
+        self.integration_preview_combo.blockSignals(True)
+        self.integration_preview_combo.clear()
+        for sample_name, path in files:
+            self.integration_preview_combo.addItem(sample_name, path)
+        self.integration_preview_combo.blockSignals(False)
+        self.update_integration_preview()
+
+    def update_integration_preview(self, *_args):
+        path = self.integration_preview_combo.currentData()
+        if not path:
+            self.integration_axes.clear()
+            self.integration_axes.set_title("Integration sample preview")
+            self.integration_canvas.draw_idle()
+            self.integration_preview_signal.clear()
+            self.integration_mz_axis_combo.setVisible(False)
+            self.integration_mz_scan_combo.setVisible(False)
+            self.integration_preview_status.setText("No chromatogram CSV samples found.")
+            return
+        try:
+            channels = read_chrom_csv_channels(path)
+        except (OSError, csv.Error) as exc:
+            self.integration_preview_status.setText(f"Could not read sample: {exc}")
+            return
+        csv_type = classify_csv_type(path)
+        is_mz = csv_type == "m/z"
+        self.integration_mz_axis_combo.setVisible(is_mz)
+        self.integration_mz_scan_combo.setVisible(is_mz)
+        self.integration_preview_signal.blockSignals(True)
+        previous_signal = self.integration_preview_signal.currentText()
+        self.integration_preview_signal.clear()
+        self.integration_preview_signal.addItems([name for name, _, _ in channels])
+        if previous_signal in [name for name, _, _ in channels]:
+            self.integration_preview_signal.setCurrentText(previous_signal)
+        self.integration_preview_signal.blockSignals(False)
+
+        if is_mz:
+            try:
+                frame = pd.read_csv(path)
+                rt_column = find_rt_column(frame)
+                self.integration_mz_scan_combo.blockSignals(True)
+                self.integration_mz_scan_combo.clear()
+                for row_index, rt_value in enumerate(pd.to_numeric(frame[rt_column], errors="coerce")):
+                    if pd.notna(rt_value):
+                        self.integration_mz_scan_combo.addItem(f"{rt_value:g} min", row_index)
+                self.integration_mz_scan_combo.blockSignals(False)
+            except (OSError, ValueError, KeyError) as exc:
+                self.integration_preview_status.setText(f"Could not load m/z scans: {exc}")
+                return
+
+        selected_name = self.integration_preview_signal.currentText()
+        selected_channel = next((channel for channel in channels if channel[0] == selected_name), None)
+        self.integration_axes.clear()
+        if selected_channel is None:
+            self.integration_axes.set_title("Integration sample preview")
+            self.integration_canvas.draw_idle()
+            self.integration_preview_status.setText("Selected sample has no numeric signal columns.")
+            return
+
+        _, times, intensities = selected_channel
+        if is_mz and self.integration_mz_axis_combo.currentData() == "mz":
+            frame = pd.read_csv(path)
+            rt_column = find_rt_column(frame)
+            scan_index = self.integration_mz_scan_combo.currentData()
+            scan_index = 0 if scan_index is None else int(scan_index)
+            mass_columns = []
+            for column in frame.columns:
+                if column == rt_column:
+                    continue
+                try:
+                    mass_columns.append((column, float(str(column).strip())))
+                except ValueError:
+                    continue
+            masses = [mass for _, mass in mass_columns]
+            values = [
+                pd.to_numeric(pd.Series([frame.iloc[scan_index][column]]), errors="coerce").iloc[0]
+                for column, _ in mass_columns
+            ]
+            spacing = min(
+                (abs(right - left) for left, right in zip(masses, masses[1:]) if right != left),
+                default=1.0,
+            )
+            self.integration_axes.bar(masses, values, width=spacing * 0.8, color="#207567")
+            rt_value = frame.iloc[scan_index][rt_column]
+            self.integration_axes.set_xlabel("m/z")
+            self.integration_axes.set_title(f"{self.integration_preview_combo.currentText()} at RT {rt_value:g} min")
+            self.integration_axes.grid(True, axis="y", alpha=0.3)
+            self.integration_preview_status.setText(f"m/z | Mass spectrum at RT {rt_value:g} min")
+            self.integration_canvas.draw_idle()
+            return
+
+        if is_mz:
+            spacing = min(
+                (abs(right - left) for left, right in zip(times, times[1:]) if right != left),
+                default=1.0,
+            )
+            self.integration_axes.bar(times, intensities, width=min(spacing * 0.8, 0.8), color="#207567")
+            self.integration_axes.grid(True, axis="y", alpha=0.3)
+        else:
+            self.integration_axes.plot(times, intensities, color="#207567", linewidth=1.5)
+        for center, tol_minus, tol_plus in self.targets:
+            self.integration_axes.axvspan(
+                center - tol_minus,
+                center + tol_plus,
+                color="#dc8b36",
+                alpha=0.16,
+            )
+        self.integration_axes.set_xlabel("Retention time (min)")
+        ylabel = {
+            "DAD": "Absorbance (AU)",
+            "TIC": "Total ion current",
+            "m/z": "Ion intensity",
+        }.get(csv_type, "Signal")
+        self.integration_axes.set_ylabel(ylabel)
+        self.integration_axes.set_title(self.integration_preview_combo.currentText())
+        self.integration_axes.grid(True, alpha=0.3)
+        self.integration_canvas.draw_idle()
+        self.integration_preview_status.setText(
+            f"{csv_type} | {len(times)} points | shaded regions are target windows"
+        )
+
     def _build_template_menu(self, parent_layout):
         self.template_button = QToolButton()
         self.template_button.setText("Templates")
