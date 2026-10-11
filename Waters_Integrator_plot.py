@@ -5,15 +5,49 @@ import os
 import sys
 import re
 import csv
+import json
 import math
 import fnmatch
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 from typing import List, Optional
 
 import pandas as pd
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QFormLayout,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QAbstractItemView,
+    QBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QSpinBox,
+    QStyleFactory,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+    QWidgetAction,
+)
 from rainbow.waters import masslynx
 
 # ---------------------------
@@ -500,522 +534,700 @@ def integrate_peak_asym(times, intens, center, tol_minus, tol_plus, smooth_win=5
         if dt > 0:
             area += 0.5 * (y_corr[k] + y_corr[k + 1]) * dt
     return area
+class CollapsibleSection(QWidget):
+    expandedChanged = Signal(object, bool)
+
+    def __init__(self, title: str, expanded: bool = True):
+        super().__init__()
+        self.setObjectName("collapsibleSection")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.toggle = QToolButton()
+        self.toggle.setObjectName("sectionToggle")
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.toggle.setSizePolicy(self.toggle.sizePolicy().horizontalPolicy(), self.toggle.sizePolicy().verticalPolicy())
+        layout.addWidget(self.toggle)
+
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(14, 10, 14, 14)
+        self.body_layout.setSpacing(10)
+        self.body.setVisible(expanded)
+        layout.addWidget(self.body)
+        self.toggle.toggled.connect(self._set_expanded)
+
+    def _set_expanded(self, expanded: bool):
+        self.body.setVisible(expanded)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.expandedChanged.emit(self, expanded)
 
 
-# ---------------------------
-# GUI
-# ---------------------------
-
-class GCApp(tk.Tk):
+class MassLynxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("MassLynx .raw — Extract & Integrate")
-        self.geometry("980x760")
-        self.minsize(960, 670)
+        self.setWindowTitle("MassLynx | Chromatography workspace")
+        self.resize(1280, 900)
+        self.setMinimumSize(640, 440)
 
-        # data models
-        self.targets: List[tuple] = []  # (center_min, tol_minus_min, tol_plus_min)
-        self.raw_root_var = tk.StringVar()
-        self.merge_wavelengths_var = tk.StringVar()
-        self.group_match_mode_var = tk.StringVar(value="Regex")
-        self.preview_summary_var = tk.StringVar(value="Select a root folder, then preview samples.")
-        self.csv_folder_var = tk.StringVar()
-        self.center_var = tk.StringVar()
-        self.tol_minus_var = tk.StringVar()
-        self.tol_plus_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="Ready.")
-
-        # plotting tool vars
-        self.plot_folder_var = tk.StringVar()
-        self.plot_file_var = tk.StringVar()
-        self.plot_dataset_var = tk.StringVar()
-        self.plot_all_datasets_var = tk.BooleanVar(value=False)
-        self.plot_status_var = tk.StringVar(value="Choose a folder to preview chromatograms.")
+        self.targets = []
         self.plot_paths = {}
         self.plot_dataframe = None
+        self.plot_csv_type = "CSV"
+        self.settings = QSettings("VBK_BSc_Thesis_FDA2026", "MassLynxIntegrator")
+        try:
+            self.recent_targets = json.loads(self.settings.value("recentTargets", "[]"))
+        except (TypeError, json.JSONDecodeError):
+            self.recent_targets = []
+        try:
+            self.templates = json.loads(self.settings.value("templates", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            self.templates = {}
+        if not isinstance(self.recent_targets, list):
+            self.recent_targets = []
+        if not isinstance(self.templates, dict):
+            self.templates = {}
+        self.native_style_name = QApplication.style().objectName()
+        self.system_palette = QPalette(QApplication.palette())
+        self._responsive_narrow = None
+        self.figure = Figure(figsize=(8, 4), dpi=100, constrained_layout=True)
+        self.axes = self.figure.add_subplot(111)
 
         self._build_ui()
 
     def _build_ui(self):
-        pad = 8
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setMinimumWidth(0)
+        content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(22, 18, 22, 18)
+        content_layout.setSpacing(12)
 
-        # ===== Extraction section (top) =====
-        frm_extract = ttk.LabelFrame(self, text="1) Data extraction (MassLynx .raw → csvs)")
-        frm_extract.grid(row=0, column=0, columnspan=3, sticky="ew", padx=pad, pady=(pad, 0))
-        frm_extract.columnconfigure(1, weight=1)
+        title = QLabel("MassLynx data workspace")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel("Extract RAW runs, organize samples, integrate peaks, and inspect chromatograms.")
+        subtitle.setObjectName("pageSubtitle")
+        heading = QVBoxLayout()
+        heading.addWidget(title)
+        heading.addWidget(subtitle)
 
-        ttk.Label(frm_extract, text="Root folder (containing .raw runs):").grid(
-            row=0, column=0, sticky="w", padx=(6, 6), pady=6
-        )
-        ent_raw = ttk.Entry(frm_extract, textvariable=self.raw_root_var)
-        ent_raw.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=6)
-        ttk.Button(frm_extract, text="Browse…", command=self.browse_raw_root).grid(
-            row=0, column=2, padx=(0, 6), pady=6
-        )
-        ttk.Button(frm_extract, text="Extract", command=self.extract_clicked).grid(
-            row=0, column=3, padx=(0, 6), pady=6
-        )
-        ttk.Label(frm_extract, text="Merge wavelengths (nm, comma-separated):").grid(
-            row=1, column=0, sticky="w", padx=(6, 6), pady=(0, 6)
-        )
-        ttk.Entry(frm_extract, textvariable=self.merge_wavelengths_var).grid(
-            row=1, column=1, columnspan=3, sticky="ew", padx=(0, 6), pady=(0, 6)
-        )
-        ttk.Label(frm_extract, text="Folder rules (one per line: pattern => folder):").grid(
-            row=2, column=0, sticky="nw", padx=(6, 6), pady=(0, 6)
-        )
-        self.group_rules_text = tk.Text(frm_extract, height=3, width=36, wrap="none")
-        self.group_rules_text.grid(
-            row=2, column=1, columnspan=2, sticky="ew", padx=(0, 6), pady=(0, 6)
-        )
-        frm_match_mode = ttk.Frame(frm_extract)
-        frm_match_mode.grid(row=2, column=3, sticky="nw", padx=(0, 6), pady=(0, 6))
-        ttk.Radiobutton(
-            frm_match_mode,
-            text="Wildcard",
-            variable=self.group_match_mode_var,
-            value="Wildcard",
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(
-            frm_match_mode,
-            text="Regex",
-            variable=self.group_match_mode_var,
-            value="Regex",
-        ).grid(row=1, column=0, sticky="w")
-        ttk.Label(frm_match_mode, text=r"Folders: () | (?P<name>) => \1 | \g<name>").grid(
-            row=2, column=0, sticky="w"
-        )
-        ttk.Label(frm_match_mode, text=r"Nested folders: / or \\").grid(
-            row=3, column=0, sticky="w"
-        )
-        self.preview_tree = ttk.Treeview(
-            frm_extract,
-            columns=("sample", "folder"),
-            show="headings",
-            height=5,
-        )
-        self.preview_tree.heading("sample", text="RAW sample")
-        self.preview_tree.heading("folder", text="Output subfolder")
-        self.preview_tree.column("sample", width=300, anchor="w")
-        self.preview_tree.column("folder", width=180, anchor="w")
-        self.preview_tree.grid(
-            row=3, column=1, columnspan=2, sticky="ew", padx=(0, 6), pady=(0, 6)
-        )
-        preview_scrollbar = ttk.Scrollbar(
-            frm_extract,
-            orient="vertical",
-            command=self.preview_tree.yview,
-        )
-        preview_scrollbar.grid(row=3, column=3, sticky="ns", padx=(0, 6), pady=(0, 6))
-        self.preview_tree.configure(yscrollcommand=preview_scrollbar.set)
-        ttk.Button(frm_extract, text="Preview", command=self.refresh_raw_preview).grid(
-            row=3, column=0, sticky="nw", padx=6, pady=(0, 6)
-        )
-        ttk.Label(frm_extract, textvariable=self.preview_summary_var).grid(
-            row=4, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6)
-        )
+        appearance = QHBoxLayout()
+        appearance.addWidget(QLabel("Style"))
+        self.theme_style_combo = QComboBox()
+        self.theme_style_combo.addItem("Qt default", "qt")
+        self.theme_style_combo.addItem("Windows 11", "windows11")
+        style_index = self.theme_style_combo.findData(self.settings.value("theme/style", "qt"))
+        self.theme_style_combo.setCurrentIndex(max(style_index, 0))
+        appearance.addWidget(self.theme_style_combo)
+        appearance.addWidget(QLabel("Mode"))
+        self.theme_mode_combo = QComboBox()
+        self.theme_mode_combo.addItem("System default", "system")
+        self.theme_mode_combo.addItem("Light", "light")
+        self.theme_mode_combo.addItem("Dark", "dark")
+        mode_index = self.theme_mode_combo.findData(self.settings.value("theme/mode", "system"))
+        self.theme_mode_combo.setCurrentIndex(max(mode_index, 0))
+        appearance.addWidget(self.theme_mode_combo)
 
-        # ===== Integration: folder for CSVs =====
-        frm_csv = ttk.LabelFrame(self, text="2) Integration target folder (chromatographic CSVs)")
-        frm_csv.grid(row=1, column=0, columnspan=3, sticky="ew", padx=pad, pady=(pad, 0))
-        frm_csv.columnconfigure(1, weight=1)
+        header = QHBoxLayout()
+        header.addLayout(heading, 1)
+        header.addLayout(appearance)
+        content_layout.addLayout(header)
 
-        ttk.Label(frm_csv, text="CSV folder:").grid(row=0, column=0, sticky="w", padx=(6, 6), pady=6)
-        ent_csv = ttk.Entry(frm_csv, textvariable=self.csv_folder_var)
-        ent_csv.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=6)
-        ttk.Button(frm_csv, text="Browse…", command=self.browse_csv_folder).grid(
-            row=0, column=2, padx=(0, 6), pady=6
+        self._build_extraction_section(content_layout)
+        self._build_integration_section(content_layout)
+        self._build_plot_section(content_layout)
+        self.sections = content.findChildren(CollapsibleSection)
+        for section in self.sections:
+            section.expandedChanged.connect(self.handle_section_expanded)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        self.setCentralWidget(scroll)
+        self.statusBar().showMessage("Ready")
+        self.theme_style_combo.currentIndexChanged.connect(self.apply_theme)
+        self.theme_mode_combo.currentIndexChanged.connect(self.apply_theme)
+        QApplication.styleHints().colorSchemeChanged.connect(self.apply_theme)
+        self.apply_theme()
+    def apply_theme(self, *_args):
+        app = QApplication.instance()
+        mode = self.theme_mode_combo.currentData() or "system"
+        theme = self.theme_style_combo.currentData()
+        available_styles = {name.casefold(): name for name in QStyleFactory.keys()}
+        if theme == "windows11":
+            style_name = available_styles.get("windows11", available_styles.get("windows", "Fusion"))
+        elif mode != "system":
+            style_name = available_styles.get("fusion", "Fusion")
+        else:
+            style_name = available_styles.get(self.native_style_name.casefold(), self.native_style_name)
+        style = QStyleFactory.create(style_name) or QStyleFactory.create("Fusion")
+        if style is not None:
+            app.setStyle(style)
+
+        if mode == "system":
+            system_scheme = QApplication.styleHints().colorScheme()
+            if system_scheme == Qt.ColorScheme.Unknown:
+                system_dark = self.system_palette.color(QPalette.ColorRole.Window).lightness() < 128
+            else:
+                system_dark = system_scheme == Qt.ColorScheme.Dark
+        else:
+            system_dark = mode == "dark"
+
+        if theme == "qt" and mode == "system":
+            self.setStyleSheet("")
+            app.setPalette(self.system_palette)
+            self.settings.setValue("theme/style", theme)
+            self.settings.setValue("theme/mode", mode)
+            return
+
+        if system_dark:
+            colors = {
+                "window": "#202124",
+                "text": "#e8eaed",
+                "base": "#17191c",
+                "alternate": "#25282d",
+                "button": "#2b2e33",
+                "border": "#41464d",
+                "muted": "#aab2bd",
+                "accent": "#4cc2ff" if theme == "windows11" else "#62a0ea",
+                "accent_text": "#10202a",
+            }
+        else:
+            colors = {
+                "window": "#f3f5f7" if theme == "windows11" else "#f0f0f0",
+                "text": "#202124",
+                "base": "#ffffff",
+                "alternate": "#f3f5f7",
+                "button": "#f5f6f7",
+                "border": "#d4d9df",
+                "muted": "#606a75",
+                "accent": "#0067c0" if theme == "windows11" else "#3584e4",
+                "accent_text": "#ffffff",
+            }
+
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(colors["window"]))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(colors["text"]))
+        palette.setColor(QPalette.ColorRole.Base, QColor(colors["base"]))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor(colors["alternate"]))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(colors["base"]))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor(colors["text"]))
+        palette.setColor(QPalette.ColorRole.Text, QColor(colors["text"]))
+        palette.setColor(QPalette.ColorRole.Button, QColor(colors["button"]))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(colors["text"]))
+        palette.setColor(QPalette.ColorRole.Link, QColor(colors["accent"]))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(colors["accent"]))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(colors["accent_text"]))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(colors["muted"]))
+        app.setPalette(palette)
+
+        if theme == "windows11":
+            self.setStyleSheet(
+                "QMainWindow, QScrollArea { background: %(window)s; }"
+                "QLabel { color: %(text)s; }"
+                "QLabel#pageTitle { font-size: 22px; font-weight: 700; }"
+                "QLabel#pageSubtitle { color: %(muted)s; padding-bottom: 5px; }"
+                "QWidget#collapsibleSection { background: %(base)s; border: 1px solid %(border)s; border-radius: 8px; }"
+                "QToolButton#sectionToggle { text-align: left; padding: 12px 14px; border: 0;"
+                " border-top-left-radius: 8px; border-top-right-radius: 8px; background: %(alternate)s;"
+                " color: %(text)s; font-size: 14px; font-weight: 650; }"
+                "QLineEdit, QTextEdit, QComboBox, QTableWidget { background: %(base)s; color: %(text)s;"
+                " border: 1px solid %(border)s; border-radius: 6px; padding: 7px;"
+                " selection-background-color: %(accent)s; }"
+                "QPushButton { background: %(accent)s; color: %(accent_text)s; border: 0; border-radius: 6px;"
+                " padding: 8px 13px; font-weight: 600; }"
+                "QPushButton:hover { background: %(accent_hover)s; }"
+                "QPushButton#secondaryButton { background: %(alternate)s; color: %(text)s; border: 1px solid %(border)s; }"
+                "QHeaderView::section { background: %(alternate)s; color: %(text)s; padding: 7px; border: 0; }"
+                "QStatusBar { background: %(alternate)s; color: %(text)s; }"
+                % {
+                    **colors,
+                    "accent_hover": "#78d0ff" if system_dark else "#2284d6",
+                }
+            )
+        else:
+            self.setStyleSheet("")
+
+        self.settings.setValue("theme/style", theme)
+        self.settings.setValue("theme/mode", mode)
+
+    def handle_section_expanded(self, source, expanded: bool):
+        if expanded:
+            for section in self.sections:
+                if section is not source and section.toggle.isChecked():
+                    section.toggle.setChecked(False)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+    def _build_extraction_section(self, parent_layout):
+        section = CollapsibleSection("01  Extraction and sample organization", expanded=True)
+        parent_layout.addWidget(section)
+        form = QGridLayout()
+        section.body_layout.addLayout(form)
+
+        self.raw_root_edit = QLineEdit()
+        self.raw_root_edit.setPlaceholderText("Folder containing MassLynx .raw runs")
+        browse_root = QPushButton("Browse")
+        browse_root.setObjectName("secondaryButton")
+        browse_root.clicked.connect(self.browse_raw_root)
+        form.addWidget(QLabel("RAW root"), 0, 0)
+        form.addWidget(self.raw_root_edit, 0, 1)
+        form.addWidget(browse_root, 0, 2)
+
+        self.merge_wavelengths_edit = QLineEdit()
+        self.merge_wavelengths_edit.setPlaceholderText("e.g. 240, 270")
+        form.addWidget(QLabel("Merge wavelengths (nm)"), 1, 0)
+        form.addWidget(self.merge_wavelengths_edit, 1, 1, 1, 2)
+
+        self.group_rules_edit = QTextEdit()
+        self.group_rules_edit.setPlaceholderText(
+            "One rule per line: pattern => folder\n"
+            "Examples: *blank* => controls\n"
+            r"^(?P<batch>[^_]+)_(\d+)\.raw$ => \g<batch>/rep_\2"
         )
+        self.group_rules_edit.setMaximumHeight(88)
+        form.addWidget(QLabel("Folder rules"), 2, 0, Qt.AlignmentFlag.AlignTop)
+        form.addWidget(self.group_rules_edit, 2, 1, 1, 2)
 
-        # ===== Peak targets & list =====
-        frm_inputs = ttk.LabelFrame(self, text="3) Add peak targets")
-        frm_inputs.grid(row=2, column=0, sticky="nsew", padx=pad, pady=pad)
-        for c in range(3):
-            frm_inputs.columnconfigure(c, weight=1)
+        mode_layout = QHBoxLayout()
+        self.wildcard_radio = QRadioButton("Wildcard")
+        self.regex_radio = QRadioButton("Regex")
+        self.regex_radio.setChecked(True)
+        mode_layout.addWidget(QLabel("Match mode"))
+        mode_layout.addWidget(self.wildcard_radio)
+        mode_layout.addWidget(self.regex_radio)
+        mode_layout.addStretch(1)
+        section.body_layout.addLayout(mode_layout)
 
-        ttk.Label(frm_inputs, text="Retention time (min):").grid(
-            row=0, column=0, sticky="w", padx=6, pady=(6, 2)
+        preview_toolbar = QHBoxLayout()
+        preview_button = QPushButton("Preview samples")
+        preview_button.setObjectName("secondaryButton")
+        preview_button.clicked.connect(self.refresh_raw_preview)
+        self.raw_preview_summary = QLabel("Select a root folder to preview samples.")
+        preview_toolbar.addWidget(preview_button)
+        preview_toolbar.addWidget(self.raw_preview_summary, 1)
+        section.body_layout.addLayout(preview_toolbar)
+
+        self.raw_preview_table = QTableWidget(0, 2)
+        self.raw_preview_table.setHorizontalHeaderLabels(["RAW sample", "Destination"])
+        self.raw_preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.raw_preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.raw_preview_table.setMaximumHeight(175)
+        section.body_layout.addWidget(self.raw_preview_table)
+
+        extract_button = QPushButton("Extract files")
+        extract_button.clicked.connect(self.extract_clicked)
+        section.body_layout.addWidget(extract_button, 0, Qt.AlignmentFlag.AlignRight)
+
+    def _build_integration_section(self, parent_layout):
+        section = CollapsibleSection("02  Peak integration", expanded=False)
+        parent_layout.addWidget(section)
+
+        folder_row = QHBoxLayout()
+        self.csv_folder_edit = QLineEdit()
+        self.csv_folder_edit.setPlaceholderText("Chromatogram CSV folder")
+        browse = QPushButton("Browse")
+        browse.setObjectName("secondaryButton")
+        browse.clicked.connect(self.browse_csv_folder)
+        folder_row.addWidget(QLabel("CSV folder"))
+        folder_row.addWidget(self.csv_folder_edit, 1)
+        folder_row.addWidget(browse)
+        section.body_layout.addLayout(folder_row)
+
+        target_panel = QWidget()
+        target_layout = QVBoxLayout(target_panel)
+        target_layout.setContentsMargins(0, 0, 0, 0)
+        target_form = QGridLayout()
+        target_form.addWidget(QLabel("Retention time (min)"), 0, 0)
+        target_form.addWidget(QLabel("Tolerance - (min)"), 0, 1)
+        target_form.addWidget(QLabel("Tolerance + (min)"), 0, 2)
+        self.center_edit = QLineEdit()
+        self.tol_minus_edit = QLineEdit()
+        self.tol_plus_edit = QLineEdit()
+        for column, edit in enumerate((self.center_edit, self.tol_minus_edit, self.tol_plus_edit)):
+            edit.setPlaceholderText("0.000")
+            target_form.addWidget(edit, 1, column)
+        add_target_button = QPushButton("Add target")
+        add_target_button.setObjectName("secondaryButton")
+        add_target_button.clicked.connect(self.add_target)
+        target_form.addWidget(add_target_button, 1, 3)
+        target_layout.addLayout(target_form)
+
+        target_row = QHBoxLayout()
+        self.target_table = QTableWidget(0, 3)
+        self.target_table.setHorizontalHeaderLabels(["Center (min)", "Tol -", "Tol +"])
+        self.target_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.target_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.target_table.setMaximumHeight(150)
+        target_row.addWidget(self.target_table, 1)
+        target_actions = QVBoxLayout()
+        delete_target = QPushButton("Delete selected")
+        delete_target.setObjectName("secondaryButton")
+        delete_target.clicked.connect(self.delete_selected_targets)
+        run_integration = QPushButton("Integrate CSVs")
+        run_integration.clicked.connect(self.integrate_clicked)
+        target_actions.addWidget(delete_target)
+        target_actions.addStretch(1)
+        target_actions.addWidget(run_integration)
+        target_row.addLayout(target_actions)
+        target_layout.addLayout(target_row)
+        section.body_layout.addWidget(target_panel)
+    def _build_plot_section(self, parent_layout):
+        section = CollapsibleSection("03  CSV data preview", expanded=False)
+        parent_layout.addWidget(section)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.csv_preview_splitter = splitter
+        controls = QWidget()
+        controls.setMinimumWidth(220)
+        controls.setMaximumWidth(380)
+        controls_layout = QFormLayout(controls)
+        controls_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        folder_row = QHBoxLayout()
+        self.plot_folder_edit = QLineEdit()
+        self.plot_folder_edit.setPlaceholderText("CSV folder")
+        browse = QPushButton("Browse")
+        browse.setObjectName("secondaryButton")
+        browse.clicked.connect(self.browse_plot_folder)
+        folder_row.addWidget(self.plot_folder_edit, 1)
+        folder_row.addWidget(browse)
+        controls_layout.addRow("Folder", folder_row)
+
+        self.plot_file_table = QTableWidget(0, 2)
+        self.plot_file_table.setHorizontalHeaderLabels(["CSV file", "Subfolder"])
+        self.plot_file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.plot_file_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.plot_file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.plot_file_table.setAlternatingRowColors(True)
+        self.plot_file_table.setMinimumHeight(180)
+        self.plot_file_table.setMaximumHeight(320)
+        self.plot_file_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.plot_file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.plot_file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.plot_file_table.itemSelectionChanged.connect(self.load_plot_csv)
+        controls_layout.addRow("CSV files", self.plot_file_table)
+        self.plot_signal_combo = QComboBox()
+        self.plot_signal_combo.currentIndexChanged.connect(self.update_plot)
+        controls_layout.addRow("Signal", self.plot_signal_combo)
+        self.plot_all_checkbox = QCheckBox("Show all signals")
+        self.plot_all_checkbox.toggled.connect(self.update_plot)
+        controls_layout.addRow("Overlay", self.plot_all_checkbox)
+        self.plot_controls_checkbox = QCheckBox("Plot controls")
+        controls_layout.addRow(self.plot_controls_checkbox)
+        reload_button = QPushButton("Reload CSV list")
+        reload_button.setObjectName("secondaryButton")
+        reload_button.clicked.connect(self.refresh_plot_files)
+        controls_layout.addRow(reload_button)
+        self.plot_status_label = QLabel("Choose a folder to preview chromatograms.")
+        self.plot_status_label.setWordWrap(True)
+        controls_layout.addRow(self.plot_status_label)
+
+        plot_panel = QWidget()
+        plot_layout = QVBoxLayout(plot_panel)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_canvas = FigureCanvasQTAgg(self.figure)
+        self.plot_toolbar = NavigationToolbar2QT(self.plot_canvas, plot_panel)
+        self.plot_toolbar.setVisible(False)
+        self.plot_controls_checkbox.toggled.connect(self.plot_toolbar.setVisible)
+        plot_layout.addWidget(self.plot_toolbar)
+        plot_layout.addWidget(self.plot_canvas)
+
+        splitter.addWidget(controls)
+        splitter.addWidget(plot_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setHandleWidth(10)
+        splitter.setChildrenCollapsible(False)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setSizes([260, 420])
+        splitter.handle(1).setCursor(Qt.CursorShape.SplitHCursor)
+        splitter.handle(1).setStyleSheet(
+            "QSplitter::handle { background: palette(mid); }"
+            "QSplitter::handle:hover { background: palette(highlight); }"
         )
-        ttk.Label(frm_inputs, text="Tol − (min):").grid(
-            row=0, column=1, sticky="w", padx=6, pady=(6, 2)
-        )
-        ttk.Label(frm_inputs, text="Tol + (min):").grid(
-            row=0, column=2, sticky="w", padx=6, pady=(6, 2)
-        )
-
-        ent_center = ttk.Entry(frm_inputs, textvariable=self.center_var, width=16)
-        ent_tol_minus = ttk.Entry(frm_inputs, textvariable=self.tol_minus_var, width=16)
-        ent_tol_plus = ttk.Entry(frm_inputs, textvariable=self.tol_plus_var, width=16)
-        ent_center.grid(row=1, column=0, sticky="ew", padx=6)
-        ent_tol_minus.grid(row=1, column=1, sticky="ew", padx=6)
-        ent_tol_plus.grid(row=1, column=2, sticky="ew", padx=6)
-
-        ttk.Button(frm_inputs, text="Add", command=self.add_target).grid(
-            row=2, column=0, columnspan=3, pady=(8, 8)
-        )
-
-        frm_list = ttk.LabelFrame(self, text="Targets (select + Delete)")
-        frm_list.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=pad, pady=pad)
-        frm_list.rowconfigure(0, weight=1)
-        frm_list.columnconfigure(0, weight=1)
-        self.listbox = tk.Listbox(frm_list, height=12, selectmode=tk.EXTENDED)
-        self.listbox.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        ttk.Button(frm_list, text="Delete", command=self.delete_selected).grid(
-            row=1, column=0, sticky="ew", padx=6, pady=(0, 6)
-        )
-
-        # ===== Bottom: Integrate + status =====
-        frm_run = ttk.Frame(self)
-        frm_run.grid(row=3, column=0, columnspan=3, sticky="ew", padx=pad, pady=(0, pad))
-        frm_run.columnconfigure(0, weight=1)
-        ttk.Label(frm_run, textvariable=self.status_var, foreground="#555").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Button(frm_run, text="Integrate", command=self.integrate_clicked).grid(
-            row=0, column=1, sticky="e"
-        )
-
-        # ===== Plotting tool (BOTTOM) =====
-        frm_plot = ttk.LabelFrame(self, text="4) CSV chromatogram preview")
-        frm_plot.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=pad, pady=(0, pad))
-        frm_plot.columnconfigure(1, weight=1)
-        frm_plot.rowconfigure(3, weight=1)
-
-        ttk.Label(frm_plot, text="Folder:").grid(row=0, column=0, sticky="w", padx=(6, 6), pady=6)
-        ent_plot_folder = ttk.Entry(frm_plot, textvariable=self.plot_folder_var)
-        ent_plot_folder.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=6)
-        ttk.Button(frm_plot, text="Browse…", command=self.browse_plot_folder).grid(
-            row=0, column=2, padx=(0, 6), pady=6
-        )
-
-        ttk.Label(frm_plot, text="CSV:").grid(row=1, column=0, sticky="w", padx=(6, 6), pady=6)
-        self.plot_combo = ttk.Combobox(frm_plot, textvariable=self.plot_file_var, state="readonly")
-        self.plot_combo.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=6)
-        ttk.Button(frm_plot, text="Reload", command=self.load_plot_csv).grid(
-            row=1, column=2, padx=(0, 6), pady=6
-        )
-        ttk.Label(frm_plot, text="Signal:").grid(row=2, column=0, sticky="w", padx=(6, 6), pady=6)
-        self.plot_dataset_combo = ttk.Combobox(
-            frm_plot,
-            textvariable=self.plot_dataset_var,
-            state="readonly",
-        )
-        self.plot_dataset_combo.grid(row=2, column=1, sticky="ew", padx=(0, 6), pady=6)
-        ttk.Checkbutton(
-            frm_plot,
-            text="Show all signals",
-            variable=self.plot_all_datasets_var,
-            command=self.update_plot,
-        ).grid(row=2, column=2, sticky="w", padx=(0, 6), pady=6)
-
-        self.plot_figure = Figure(figsize=(8, 3.2), dpi=100, constrained_layout=True)
-        self.plot_axes = self.plot_figure.add_subplot(111)
-        self.plot_canvas = FigureCanvasTkAgg(self.plot_figure, master=frm_plot)
-        self.plot_canvas.get_tk_widget().grid(
-            row=3, column=0, columnspan=3, sticky="nsew", padx=6, pady=(0, 4)
-        )
-        ttk.Label(frm_plot, textvariable=self.plot_status_var).grid(
-            row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6)
-        )
-        self.plot_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_plot_csv())
-        self.plot_dataset_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_plot())
-
-        # layout weights
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=1)
-        self.columnconfigure(2, weight=1)
-        self.rowconfigure(2, weight=1)
-        self.rowconfigure(4, weight=1)
-
-        # convenience
-        self.listbox.bind("<Delete>", lambda e: self.delete_selected())
-
-    # --------- UI actions ---------
-
+        section.body_layout.addWidget(splitter, 1)
     def browse_raw_root(self):
-        folder = filedialog.askdirectory(title="Select root folder with .raw runs")
+        folder = QFileDialog.getExistingDirectory(self, "Select root folder with .raw runs")
         if folder:
-            self.raw_root_var.set(folder)
+            self.raw_root_edit.setText(folder)
             self.refresh_raw_preview()
 
     def refresh_raw_preview(self):
-        root = self.raw_root_var.get().strip()
-        for item in self.preview_tree.get_children():
-            self.preview_tree.delete(item)
-        if not root or not os.path.isdir(root):
-            self.preview_summary_var.set("Select a valid root folder to preview samples.")
+        root = self.raw_root_edit.text().strip()
+        if not os.path.isdir(root):
+            QMessageBox.warning(self, "Invalid folder", "Select a valid root folder first.")
             return
-        try:
-            rules = parse_group_rules(
-                self.group_rules_text.get("1.0", tk.END),
-                self.group_match_mode_var.get(),
-            )
-        except ValueError as exc:
-            self.preview_summary_var.set(str(exc))
+        rules = self.current_group_rules()
+        if rules is None:
             return
-
         raw_dirs = sorted(iter_raw_dirs(root))
-        preview_rows = []
+        self.raw_preview_table.setRowCount(0)
+        for raw_dir in raw_dirs[:20]:
+            raw_name = os.path.basename(raw_dir)
+            try:
+                destination = match_group(raw_name, rules, self.current_match_mode()) or "(root)"
+            except ValueError as exc:
+                QMessageBox.warning(self, "Invalid folder rule", str(exc))
+                return
+            row = self.raw_preview_table.rowCount()
+            self.raw_preview_table.insertRow(row)
+            self.raw_preview_table.setItem(row, 0, QTableWidgetItem(raw_name))
+            self.raw_preview_table.setItem(row, 1, QTableWidgetItem(destination))
+        self.raw_preview_summary.setText(f"Found {len(raw_dirs)} samples; previewing {min(20, len(raw_dirs))}.")
+
+    def current_match_mode(self):
+        return "Regex" if self.regex_radio.isChecked() else "Wildcard"
+
+    def current_group_rules(self):
         try:
-            for raw_dir in raw_dirs[:20]:
-                raw_name = os.path.basename(raw_dir)
-                group = match_group(raw_name, rules, self.group_match_mode_var.get())
-                preview_rows.append((raw_name, group or "(root)"))
+            return parse_group_rules(self.group_rules_edit.toPlainText(), self.current_match_mode())
         except ValueError as exc:
-            self.preview_summary_var.set(str(exc))
-            return
-        for raw_name, group in preview_rows:
-            self.preview_tree.insert("", tk.END, values=(raw_name, group))
-        shown = min(len(raw_dirs), 20)
-        self.preview_summary_var.set(f"Found {len(raw_dirs)} RAW samples; showing {shown}.")
-
-    def browse_csv_folder(self):
-        folder = filedialog.askdirectory(title="Select folder containing chromatogram CSVs")
-        if folder:
-            self.csv_folder_var.set(folder)
-
-    def add_target(self):
-        try:
-            center = float(self.center_var.get().strip())
-            tol_minus = float(self.tol_minus_var.get().strip())
-            tol_plus = float(self.tol_plus_var.get().strip())
-        except ValueError:
-            messagebox.showerror("Invalid input", "Please enter numeric values for time and tolerances.")
-            return
-        if tol_minus < 0 or tol_plus < 0:
-            messagebox.showerror("Invalid input", "Tolerances must be non-negative.")
-            return
-        if tol_minus == 0 and tol_plus == 0:
-            messagebox.showerror("Invalid input", "At least one of the tolerances must be > 0.")
-            return
-        self.targets.append((center, tol_minus, tol_plus))
-        self.listbox.insert(
-            tk.END,
-            f"{center:.3f} min  - {tol_minus:.3f} min  + {tol_plus:.3f} min"
-        )
-        self.center_var.set("")
-        self.tol_minus_var.set("")
-        self.tol_plus_var.set("")
-
-    def delete_selected(self):
-        sel = list(self.listbox.curselection())
-        if not sel:
-            return
-        for idx in reversed(sel):
-            del self.targets[idx]
-            self.listbox.delete(idx)
-
-    # --------- Core actions ---------
+            QMessageBox.warning(self, "Invalid folder rule", str(exc))
+            return None
 
     def extract_clicked(self):
-        root = self.raw_root_var.get().strip()
-        if not root or not os.path.isdir(root):
-            messagebox.showerror(
-                "Invalid folder",
-                "Please select a valid root folder containing MassLynx .raw runs."
-            )
+        root = self.raw_root_edit.text().strip()
+        if not os.path.isdir(root):
+            QMessageBox.warning(self, "Invalid folder", "Select a valid root folder first.")
             return
         try:
-            merge_wavelengths = parse_merge_wavelengths(self.merge_wavelengths_var.get())
-        except ValueError as e:
-            messagebox.showerror("Invalid wavelength", str(e))
+            merge_wavelengths = parse_merge_wavelengths(self.merge_wavelengths_edit.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid wavelength", str(exc))
             return
-        try:
-            group_rules = parse_group_rules(
-                self.group_rules_text.get("1.0", tk.END),
-                self.group_match_mode_var.get(),
-            )
-        except ValueError as e:
-            messagebox.showerror("Invalid folder rule", str(e))
+        rules = self.current_group_rules()
+        if rules is None:
             return
-        self.status_var.set("Extracting…")
-        self.update_idletasks()
+        self.statusBar().showMessage("Extracting RAW files...")
+        QApplication.processEvents()
         try:
             chrom_dir = extract_masslynx_folder(
                 root,
-                status_cb=lambda s: self.status_var.set(s),
+                status_cb=lambda message: self.statusBar().showMessage(message),
                 prec=0,
                 merge_wavelengths=merge_wavelengths,
-                group_rules=group_rules,
-                match_mode=self.group_match_mode_var.get(),
+                group_rules=rules,
+                match_mode=self.current_match_mode(),
             )
-            self.csv_folder_var.set(chrom_dir)
-            self.status_var.set(f"Extraction finished → {chrom_dir}")
-            messagebox.showinfo(
-                "Extraction finished",
-                f"Chromatographic CSV files were written to:\n{chrom_dir}\n\n"
-                f"m/z and TIC CSVs are in sibling folders:\n"
-                f"{os.path.dirname(chrom_dir)}"
-            )
-        except Exception as e:
-            self.status_var.set("Extraction failed.")
-            messagebox.showerror("Extraction failed", str(e))
+        except Exception as exc:
+            QMessageBox.critical(self, "Extraction failed", str(exc))
+            self.statusBar().showMessage("Extraction failed")
+            return
+        self.csv_folder_edit.setText(chrom_dir)
+        self.plot_folder_edit.setText(chrom_dir)
+        self.refresh_plot_files()
+        self.refresh_integration_preview_files()
+        QMessageBox.information(self, "Extraction complete", f"Chromatograms saved to:\n{chrom_dir}")
+        self.statusBar().showMessage(f"Extraction complete: {chrom_dir}")
+
+    def browse_csv_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select chromatogram CSV folder")
+        if folder:
+            self.csv_folder_edit.setText(folder)
+            self.refresh_integration_preview_files()
+
+    def add_target(self):
+        try:
+            center = float(self.center_edit.text().strip())
+            tol_minus = float(self.tol_minus_edit.text().strip())
+            tol_plus = float(self.tol_plus_edit.text().strip())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid target", "Enter numeric values for time and tolerances.")
+            return
+        if not all(math.isfinite(value) for value in (center, tol_minus, tol_plus)):
+            QMessageBox.warning(self, "Invalid target", "Target values must be finite numbers.")
+            return
+        if tol_minus < 0 or tol_plus < 0 or (tol_minus == 0 and tol_plus == 0):
+            QMessageBox.warning(self, "Invalid target", "Tolerances must be non-negative and at least one must be positive.")
+            return
+        self.targets.append((center, tol_minus, tol_plus))
+        self.remember_recent_target((center, tol_minus, tol_plus))
+        row = self.target_table.rowCount()
+        self.target_table.insertRow(row)
+        for column, value in enumerate((center, tol_minus, tol_plus)):
+            self.target_table.setItem(row, column, QTableWidgetItem(f"{value:.3f}"))
+        self.center_edit.clear()
+        self.tol_minus_edit.clear()
+        self.tol_plus_edit.clear()
+        if self.integration_preview_toggle.isChecked():
+            self.update_integration_preview()
+
+    def delete_selected_targets(self):
+        selected = sorted({index.row() for index in self.target_table.selectionModel().selectedRows()}, reverse=True)
+        for row in selected:
+            self.target_table.removeRow(row)
+            del self.targets[row]
+        if selected and self.integration_preview_toggle.isChecked():
+            self.update_integration_preview()
 
     def integrate_clicked(self):
-        csv_folder = self.csv_folder_var.get().strip()
-        if not csv_folder or not os.path.isdir(csv_folder):
-            messagebox.showerror("Invalid CSV folder", "Please select a valid CSV folder.")
-            return
-        if not self.targets:
-            messagebox.showerror("No targets", "Add at least one target with time and tolerances.")
+        folder = self.csv_folder_edit.text().strip()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.critical(self, "Invalid directory", "Please select a valid CSV folder first.")
             return
 
-        files = find_chrom_csv_files(csv_folder)
-        if not files:
-            messagebox.showwarning("No CSVs found", "No CSV files found in the selected folder.")
-            return
-
-        headers = ["Sample"] + [f"{c:.3f} min" for (c, _m, _p) in self.targets]
-        rows = []
-        processed = 0
-        self.status_var.set("Integrating…")
-        self.update_idletasks()
-
-        for sample_name, fpath in files:
+        targets = []
+        for row in range(self.target_table.rowCount()):
+            center_item = self.target_table.item(row, 0)
+            minus_item = self.target_table.item(row, 1)
+            plus_item = self.target_table.item(row, 2)
+            if not center_item or not minus_item or not plus_item:
+                continue
             try:
-                channels = read_chrom_csv_channels(fpath)
-                if not channels:
-                    raise RuntimeError("Empty/invalid chromatogram")
-                for channel_name, times, intens in channels:
-                    areas = []
-                    for center, tol_minus, tol_plus in self.targets:
-                        area = integrate_peak_asym(
-                            times, intens,
-                            center, tol_minus, tol_plus,
-                            smooth_win=5
-                        )
-                        areas.append(area)
-                    row_name = sample_name
-                    if len(channels) > 1:
-                        row_name = f"{sample_name}_{channel_name.replace(' ', '')}"
-                    row = {"Sample": row_name}
-                    for hdr, val in zip(headers[1:], areas):
-                        row[hdr] = f"{val:.6g}"
-                    rows.append(row)
-                processed += 1
-                self.status_var.set(f"Integrating… {processed}/{len(files)}")
-                self.update_idletasks()
-            except Exception:
-                row = {"Sample": sample_name}
-                for hdr in headers[1:]:
-                    row[hdr] = "0"
-                rows.append(row)
+                targets.append((
+                    float(center_item.text()),
+                    float(minus_item.text()),
+                    float(plus_item.text()),
+                ))
+            except ValueError:
+                continue
 
-        out_path = os.path.join(csv_folder, "00_evaluated_data.csv")
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers)
-            w.writeheader()
-            for r in rows:
-                w.writerow(r)
-
-        self.status_var.set(f"Done. Wrote: {out_path}")
-        messagebox.showinfo(
-            "Finished",
-            f"Integrated {processed} file(s).\nSaved:\n{out_path}"
-        )
-
-    # --------- Plotting tool actions ---------
-
-    def browse_plot_folder(self):
-        folder = filedialog.askdirectory(title="Select folder with CSV files to plot")
-        if not folder:
+        if not targets:
+            QMessageBox.critical(self, "Missing targets", "Define at least one valid integration target.")
             return
-        self.plot_folder_var.set(folder)
-        self.refresh_plot_files()
+
+        csv_files = find_chrom_csv_files(folder)
+        if not csv_files:
+            QMessageBox.critical(self, "No CSVs found", "No chromatogram CSV files were found.")
+            return
+
+        results = []
+        for sample_name, path in csv_files:
+            try:
+                frame = pd.read_csv(path)
+            except Exception:
+                continue
+            rt_col = find_rt_column(frame)
+            signals = [col for col in frame.columns if col != rt_col]
+            for col in signals:
+                label = f"{sample_name}_{col}"
+                row_data = {"Sample": label}
+                for index, (center, minus, plus) in enumerate(targets, 1):
+                    area = integrate_chrom_peak(frame, rt_col, col, center, minus, plus)
+                    row_data[f"Peak_{index}_Area"] = area
+                results.append(row_data)
+
+        if not results:
+            QMessageBox.critical(self, "Integration failed", "Could not calculate areas for any files.")
+            return
+
+        out_path = os.path.join(folder, "00_evaluated_data.csv")
+        try:
+            pd.DataFrame(results).to_csv(out_path, index=False)
+        except Exception as exc:
+            QMessageBox.critical(self, "Write failed", f"Could not write {out_path}: {exc}")
+            return
+
+        self.statusBar().showMessage(f"Evaluated data written: {out_path}")
+        QMessageBox.information(
+            self,
+            "Success",
+            f"Integration completed for {len(results)} series.\nOutput saved to:\n{out_path}",
+        )
+    def browse_plot_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder with chromatogram CSVs")
+        if folder:
+            self.plot_folder_edit.setText(folder)
+            self.refresh_plot_files()
 
     def refresh_plot_files(self):
-        folder = self.plot_folder_var.get().strip()
+        folder = self.plot_folder_edit.text().strip()
+        self.plot_file_table.setRowCount(0)
+        self.plot_signal_combo.clear()
+        self.axes.clear()
+        self.plot_canvas.draw_idle()
         if not folder or not os.path.isdir(folder):
-            self.plot_paths = {}
-            self.plot_combo["values"] = []
-            self.plot_file_var.set("")
-            self.plot_status_var.set("Select a valid folder to preview chromatograms.")
+            self.plot_status_label.setText("Select a valid folder to inspect CSV files.")
             return
 
         files = find_chrom_csv_files(folder)
-        self.plot_paths = {f"{sample_name}.csv": path for sample_name, path in files}
-        choices = list(self.plot_paths)
-        self.plot_combo["values"] = choices
-        if not choices:
-            self.plot_file_var.set("")
-            self.plot_dataset_combo["values"] = []
-            self.plot_status_var.set("No chromatogram CSV files found in this folder.")
-            self.plot_dataframe = None
-            self.update_plot()
+        self.plot_file_table.setRowCount(len(files))
+        for row, (sample_name, path) in enumerate(files):
+            relative_dir = os.path.relpath(os.path.dirname(path), folder)
+            subfolder = "(root)" if relative_dir in {"", "."} else relative_dir
+            filename_item = QTableWidgetItem(os.path.basename(path))
+            filename_item.setData(Qt.ItemDataRole.UserRole, path)
+            subfolder_item = QTableWidgetItem(subfolder)
+            self.plot_file_table.setItem(row, 0, filename_item)
+            self.plot_file_table.setItem(row, 1, subfolder_item)
+        self.plot_status_label.setText(f"Found {len(files)} CSV file(s).")
+        if files:
+            self.plot_file_table.selectRow(0)
+    def load_plot_csv(self, *_args):
+        selected_rows = self.plot_file_table.selectionModel().selectedRows()
+        if not selected_rows:
             return
-
-        self.plot_file_var.set(choices[0])
-        self.load_plot_csv()
-
-    def load_plot_csv(self):
-        selected_file = self.plot_file_var.get().strip()
-        path = self.plot_paths.get(selected_file)
-        if not path:
-            self.plot_status_var.set("Choose a CSV file to preview.")
+        row = selected_rows[0].row()
+        item = self.plot_file_table.item(row, 0)
+        if not item:
             return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        self.current_csv_path = path
         try:
-            self.plot_dataframe = pd.read_csv(path)
-        except Exception as e:
-            self.plot_dataframe = None
-            self.plot_status_var.set(f"Could not read CSV: {e}")
-            self.update_plot()
+            frame = pd.read_csv(path)
+        except Exception as exc:
+            self.plot_status_label.setText(f"Failed to load CSV: {exc}")
             return
-
-        if self.plot_dataframe.empty or len(self.plot_dataframe.columns) < 2:
-            self.plot_status_var.set("CSV must contain a time column and at least one signal column.")
-            self.update_plot()
-            return
-
-        rt_col = find_rt_column(self.plot_dataframe)
-        signal_columns = [column for column in self.plot_dataframe.columns if column != rt_col]
-        self.plot_dataset_combo["values"] = signal_columns
-        if self.plot_dataset_var.get() not in signal_columns:
-            self.plot_dataset_var.set(signal_columns[0] if signal_columns else "")
+        self.current_frame = frame
+        rt_column = find_rt_column(frame)
+        signal_columns = [column for column in frame.columns if column != rt_column]
+        self.plot_signal_combo.blockSignals(True)
+        self.plot_signal_combo.clear()
+        for column in signal_columns:
+            self.plot_signal_combo.addItem(str(column))
+        self.plot_signal_combo.blockSignals(False)
         self.update_plot()
-
-    def update_plot(self):
-        self.plot_axes.clear()
-        df = self.plot_dataframe
-        if df is None or df.empty or len(df.columns) < 2:
-            self.plot_axes.set_title("CSV chromatogram preview")
-            self.plot_canvas.draw_idle()
+    def update_plot(self, *_args):
+        if self.current_frame is None:
             return
-
-        rt_col = find_rt_column(df)
-        signal_columns = [column for column in df.columns if column != rt_col]
-        if self.plot_all_datasets_var.get():
-            selected_columns = signal_columns
-        else:
-            selected = self.plot_dataset_var.get()
-            selected_columns = [selected] if selected in signal_columns else []
-
-        x_values = pd.to_numeric(df[rt_col], errors="coerce")
+        frame = self.current_frame
+        self.axes.clear()
+        rt_column = find_rt_column(frame)
+        signal_columns = [column for column in frame.columns if column != rt_column]
+        selected = signal_columns if self.plot_all_checkbox.isChecked() else [self.plot_signal_combo.currentText()]
+        x_values = pd.to_numeric(frame[rt_column], errors="coerce")
         plotted = 0
-        for column in selected_columns:
-            y_values = pd.to_numeric(df[column], errors="coerce")
-            valid = x_values.notna() & y_values.notna()
-            if not valid.any():
+        for column in selected:
+            if column not in signal_columns:
                 continue
-            self.plot_axes.plot(x_values[valid], y_values[valid], label=str(column), linewidth=1.4)
-            plotted += 1
-
-        self.plot_axes.set_xlabel(str(rt_col))
-        self.plot_axes.set_ylabel("Signal")
-        self.plot_axes.set_title(self.plot_file_var.get())
-        self.plot_axes.grid(True, alpha=0.3)
+            y_values = pd.to_numeric(frame[column], errors="coerce")
+            valid = x_values.notna() & y_values.notna()
+            if valid.any():
+                self.axes.plot(x_values[valid], y_values[valid], label=str(column), linewidth=1.5)
+                plotted += 1
+        self.axes.set_xlabel(str(rt_column))
+        self.axes.set_ylabel("Signal")
+        self.axes.set_title(self.current_plot_title())
+        self.axes.grid(True, alpha=0.3)
         if plotted > 1:
-            self.plot_axes.legend(loc="best")
+            self.axes.legend(loc="best")
         if plotted == 0:
-            self.plot_status_var.set("No numeric signal data available to plot.")
+            status = "No numeric signal data available."
         else:
-            mode = "all signals" if self.plot_all_datasets_var.get() else str(selected_columns[0])
-            self.plot_status_var.set(f"Showing {mode} ({plotted} trace{'s' if plotted != 1 else ''}).")
+            status = f"Showing {plotted} trace(s)."
+        self.plot_status_label.setText(status)
         self.plot_canvas.draw_idle()
+    def current_plot_title(self):
+        selected_rows = self.plot_file_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return "CSV data preview"
+        row = selected_rows[0].row()
+        filename = self.plot_file_table.item(row, 0).text()
+        subfolder = self.plot_file_table.item(row, 2).text()
+        return filename if subfolder == "(root)" else os.path.join(subfolder, filename)
 
-
-# ---------------------------
-# Run
-# ---------------------------
 if __name__ == "__main__":
-    app = GCApp()
-    app.mainloop()
+    qt_app = QApplication(sys.argv)
+    window = MassLynxWindow()
+    window.show()
+    sys.exit(qt_app.exec())
