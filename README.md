@@ -3,7 +3,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A lightweight desktop GUI and processing utility to extract, integrate, and visualize chromatographic and mass spectrometry data from Waters MassLynx `.raw` directories.
+A modern desktop GUI and processing utility to extract, integrate, and visualize chromatographic and mass spectrometry data from Waters MassLynx `.raw` directories.
 
 ---
 
@@ -24,17 +24,22 @@ If you are the original author of the project and would like to be credited, ple
 - **Rule-Based Sample Grouping & Routing**:
   - Organize extracted files into structured subfolders using pattern rules (`pattern => subfolder`).
   - Supports **Wildcard** (glob) and **Regex** matching modes with capture group expansion (e.g., `\1` or `\g<name>`) and nested directory paths (`/` or `\`).
-  - Interactive sample preview table (`ttk.Treeview`) allows checking destination folder mappings before extraction.
-- **Multi-Channel & Recursive Peak Integration**:
+  - Interactive sample preview table allows checking destination folder mappings before extraction.
+- **Peak Integration with Real-Time Preview**:
   - Define custom peak retention times with **asymmetric tolerance windows** (`Tol −` and `Tol +`).
   - Automatic apex detection, moving-average smoothing, and linear baseline subtraction.
-  - Recursively processes CSVs across subfolders and evaluates multiple channels per sample (labeling individual rows e.g. `<sample>_<channel>`).
-  - Exports aggregated peak areas into `00_evaluated_data.csv`.
-- **Embedded Multi-Channel Chromatogram Preview**:
-  - Built-in Matplotlib canvas embedded directly into the application window.
-  - Preview single traces or check **Show all signals** to overlay multiple channels on a single plot with automatic legends and grid lines.
-- **Minimal Dependencies & Native GUI**:
-  - Built on Tkinter with zero heavy desktop framework overhead.
+  - **Live Integration Preview**: Toggle the interactive sample preview canvas to visualize peak apex, baseline subtraction, integration bounds, and computed peak area in real time.
+  - **Target Presets & History**: Save, load, and delete named target templates (stored in JSON), and quickly reload recently used target configurations.
+  - Recursively processes CSVs across subfolders and evaluates multiple channels per sample (labeling individual rows e.g. `<sample>_<channel>`), exporting results to `00_evaluated_data.csv`.
+- **Multi-Format CSV Inspector & Specialized Visualizations**:
+  - Automatic dataset classification: Identifies **DAD**, **TIC**, **m/z**, and **Integrated areas** CSVs.
+  - Dual-tab interface offering simultaneous **Plot preview** and raw tabular **Table preview** with sortable columns.
+  - **m/z Mass Spectra & RT Bar Series**: Plot ion intensity bar charts across retention times or inspect discrete mass spectra across m/z bins at any selected RT scan.
+  - **Integrated Areas Comparison**: Visualize and compare peak area series across multiple samples using aggregated bar charts.
+  - **High-DPI Plot Export**: Export publication-quality charts to PNG or vector SVG with customizable resolution (72–2400 DPI).
+- **Modern PySide6 (Qt) Desktop Interface**:
+  - Built on **PySide6** with responsive collapsible accordion sections.
+  - Built-in theme switcher (**Light**, **Dark**, and **System default**) with persistent user preferences.
 
 ---
 
@@ -64,10 +69,6 @@ When you extract a folder containing MassLynx runs, the application creates a st
 
 ### 1. Prerequisites
 - Python 3.8 or higher.
-- *(Linux only)*: Ensure Tkinter is installed:
-  ```bash
-  sudo apt-get install python3-tk
-  ```
 
 ### 2. Clone Repository
 ```bash
@@ -105,34 +106,33 @@ python Waters_Integrator_plot.py
 
 ### Workflow Steps
 
-1. **Data Extraction (MassLynx `.raw` &rarr; CSVs)**:
-   - Click **Browse…** in Section 1 to select the folder containing your `.raw` runs.
-   - *(Optional)* **Merge wavelengths**: Enter comma-separated wavelengths in nm (e.g., `210, 254`) to merge those traces into multi-column CSV files.
+1. **Section 01 &mdash; Extraction and Sample Organization**:
+   - Click **Browse** to select the root directory containing MassLynx `.raw` run folders.
+   - *(Optional)* **Merge wavelengths**: Enter comma-separated wavelengths in nm (e.g., `210, 254`) to merge those traces into unified multi-column CSV files.
    - *(Optional)* **Folder rules**: Enter one rule per line using `pattern => subfolder`.
-     - Choose **Wildcard** (e.g., `*Control* => Controls`) or **Regex** (e.g., `^Batch(\d+)_(.*) => Batch_\1/\2`).
+     - Choose **Wildcard** (e.g., `*Control* => Controls`) or **Regex** (e.g., `^(?P<batch>[^_]+)_(\d+)\.raw$ => \g<batch>/rep_\2`).
      - Regex mode supports capture references (`\1`, `\g<name>`) and nested folders (`/` or `\`).
-     - Click **Preview** to inspect the mapping of RAW samples to destination folders.
-   - Click **Extract**. The application will parse `_FUNC001.DAT` and `_FUNC002.DAT` files and create the `csvs/` directory structure.
+     - Click **Preview samples** to inspect the mapping of RAW samples to destination folders.
+   - Click **Extract files** to parse `_FUNC001.DAT` and `_FUNC002.DAT` files and create the `csvs/` directory hierarchy.
 
-2. **Integration Target Folder**:
-   - The CSV folder automatically populates with `<root>/csvs/chrom` after extraction, or you can select any folder containing chromatographic CSV files.
-   - Subdirectories within the selected folder are automatically discovered and processed recursively.
+2. **Section 02 &mdash; Peak Integration**:
+   - Select the CSV folder (defaults to `<root>/csvs/chrom`). Subfolders are discovered and processed recursively.
+   - **Define Peak Targets**: Enter the expected peak **Retention time (min)**, **Tolerance − (min)**, and **Tolerance + (min)**, then click **Add target**.
+   - **Target Templates & Recent History**:
+     - Use the top-bar **Templates** menu to save the current target configuration as a named template, load saved presets, or delete old ones.
+     - Use the **Recent targets** dropdown to reload recently integrated peak configurations.
+   - **Interactive Peak Preview**:
+     - Check **Open sample preview** to inspect peak integration in real time.
+     - Choose a sample from the dropdown to visualize apex detection, baseline subtraction, and window boundaries before running batch integration.
+   - Click **Integrate CSVs** to calculate peak areas across all samples and save results into `00_evaluated_data.csv`.
 
-3. **Define Peak Targets**:
-   - Enter the expected peak **Retention time (min)**.
-   - Specify asymmetric tolerances: **Tol − (min)** (window left of peak) and **Tol + (min)** (window right of peak).
-   - Click **Add**. Repeat for all compounds of interest.
-   - To remove a target, select it from the list and click **Delete**.
-
-4. **Run Integration**:
-   - Click **Integrate**.
-   - The tool iterates through all chromatograms recursively, integrating each signal channel independently (multi-channel CSVs output separate rows for each channel e.g., `<sample>_<channel>`), and saves peak areas to `00_evaluated_data.csv`.
-
-5. **CSV Chromatogram Preview**:
-   - In Section 4, select a folder containing CSV files.
-   - Select a CSV file from the dropdown (subfolders are preserved in the list).
-   - Choose a specific trace from the **Signal** dropdown or check **Show all signals** to overlay all available traces on the embedded Matplotlib figure.
-   - Click **Reload** to refresh the current file and plot view.
+3. **Section 03 &mdash; CSV Data Preview & Export**:
+   - Browse to any CSV directory (e.g. `csvs/chrom`, `csvs/tic`, `csvs/mz`, or root `csvs`).
+   - The file table displays the detected dataset type (**DAD**, **TIC**, **m/z**, or **Integrated areas**) and relative subfolder.
+   - Switch between **Plot preview** (graphical canvas) and **Table preview** (raw tabular data rows).
+   - For **m/z** data, switch between **Retention time** ion traces and **m/z values** scan spectrum bar charts.
+   - For **Integrated areas**, view multi-sample comparative bar plots.
+   - Click **Export plot** to save the visualization to **PNG** or **SVG** format with configurable DPI resolution (72–2400 DPI).
 
 ---
 
@@ -151,8 +151,8 @@ For each target peak in window $[t_{\text{target}} - \text{tol}_-, t_{\text{targ
 
 ```text
 waters-data-extractor/
-├── Waters_Integrator_plot.py  # Main application script with Tkinter GUI
-├── requirements.txt           # Python dependencies
+├── Waters_Integrator_plot.py  # Main application script with PySide6 desktop GUI
+├── requirements.txt           # Python dependencies (pandas, matplotlib, PySide6, rainbow-api)
 ├── pyproject.toml             # Project metadata and packaging config
 ├── .gitignore                 # Git ignore file for Python and raw lab data
 ├── .gitattributes             # Git line-ending and binary tracking
