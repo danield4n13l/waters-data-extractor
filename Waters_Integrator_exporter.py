@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Waters Veusz Exporter
+Waters Exporter
 ---------------------
 Dedicated standalone tool and GUI for exporting MassLynx / chromatographic
 CSV datasets into publication-ready Veusz project documents (.vsz).
@@ -462,7 +462,7 @@ def generate_veusz_vsz_project(
         "# -*- coding: utf-8 -*-",
         f"# Document: {proj_name}",
         f"# Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "# Engine: MassLynx Waters Veusz Exporter",
+        "# Engine: MassLynx Waters Python Exporter",
         "",
     ]
 
@@ -982,7 +982,7 @@ class LabPlotExporterWindow(QMainWindow):
 
     def __init__(self, initial_folder: Optional[str] = None):
         super().__init__()
-        self.setWindowTitle("Waters Veusz Exporter | Chromatographic workspace")
+        self.setWindowTitle("Waters Exporter | Chromatographic workspace")
         self.resize(1140, 860)
         self.setMinimumSize(680, 480)
 
@@ -1001,7 +1001,7 @@ class LabPlotExporterWindow(QMainWindow):
             self.csv_folder_edit.setText(str(initial))
             self.scan_datasets()
 
-        console_log("Waters Veusz Exporter initialized (Veusz standard 3.6+)", category="INIT")
+        console_log("Waters Exporter initialized (Veusz standard 3.6+)", category="INIT")
         if self.veusz_bin:
             console_log(f"Detected Veusz binary on system: {self.veusz_bin}", category="INIT")
 
@@ -1020,7 +1020,7 @@ class LabPlotExporterWindow(QMainWindow):
         content_layout.setSpacing(14)
 
         # Header: Title & Subtitle + Theme Selector
-        title = QLabel("Waters Veusz Exporter")
+        title = QLabel("Waters Exporter")
         title.setObjectName("pageTitle")
         subtitle = QLabel("Package MassLynx and chromatographic CSV datasets into publication-ready Veusz project documents (.vsz).")
         subtitle.setObjectName("pageSubtitle")
