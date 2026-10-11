@@ -19,6 +19,7 @@ If you are the original author of the project and would like to be credited, ple
   - Recursively finds and parses Waters `.raw` folders.
   - **MS / TIC (`_FUNC001.DAT`)**: Extracts complete m/z matrices and computes Total Ion Chromatograms (TIC).
   - **UV-Vis Photodiode Array (`_FUNC002.DAT`)**: Extracts absorbance traces per discrete wavelength (e.g., 210 nm, 254 nm).
+  - Adaptive parser fallback (`_safe_parse_function`) ensures compatibility across different `rainbow-api` versions.
 - **Wavelength Merging**:
   - Specify comma-separated wavelengths (e.g., `210, 254`) to combine selected channels into unified multi-column CSV files (`<sample>_<wl1>_<wl2>_nm.csv`) alongside or in place of individual single-wavelength exports.
 - **Rule-Based Sample Grouping & Routing**:
@@ -37,9 +38,15 @@ If you are the original author of the project and would like to be credited, ple
   - **m/z Mass Spectra & RT Bar Series**: Plot ion intensity bar charts across retention times or inspect discrete mass spectra across m/z bins at any selected RT scan.
   - **Integrated Areas Comparison**: Visualize and compare peak area series across multiple samples using aggregated bar charts.
   - **High-DPI Plot Export**: Export publication-quality charts to PNG or vector SVG with customizable resolution (72–2400 DPI).
-- **Modern PySide6 (Qt) Desktop Interface**:
-  - Built on **PySide6** with responsive collapsible accordion sections.
-  - Built-in theme switcher (**Light**, **Dark**, and **System default**) with persistent user preferences.
+- **Publication-Ready Veusz & LabPlot Document Export**:
+  - Generates `.vsz` (Veusz v3.6+) project files with embedded datasets (`SetData`) or linked CSVs (`ImportFileCSV`), automatic axis scaling, and curated scientific color palettes.
+  - Export directly from Section 04 of the main window or launch the dedicated standalone GUI / CLI utility (`Waters_Integrator_exporter.py`).
+  - Fallback legacy LabPlot XML support (`.lml`).
+- **Interactive Runtime Console Drawer & Modern UI**:
+  - Embedded collapsible debugging console drawer capturing stdout/stderr with timestamped categories, filter levels, and quick copy/clear tools.
+  - Visual **GripSplitters** with draggable dot grip styling.
+  - Quick **Open** buttons to launch directories in native system file explorers (Explorer, Finder, xdg-open).
+  - Built-in theme switcher (**Light**, **Dark**, and **System default**) with persistent user preferences and JSON backup.
 
 ---
 
@@ -98,16 +105,18 @@ pip install -r requirements.txt
 
 ## Usage Guide
 
-Launch the graphical interface:
+### Main Application Workspace
+
+Launch the primary graphical interface:
 
 ```bash
 python Waters_Integrator_plot.py
 ```
 
-### Workflow Steps
+#### Workflow Steps
 
 1. **Section 01 &mdash; Extraction and Sample Organization**:
-   - Click **Browse** to select the root directory containing MassLynx `.raw` run folders.
+   - Click **Browse** to select the root directory containing MassLynx `.raw` run folders (or click **Open** to inspect it in the file manager).
    - *(Optional)* **Merge wavelengths**: Enter comma-separated wavelengths in nm (e.g., `210, 254`) to merge those traces into unified multi-column CSV files.
    - *(Optional)* **Folder rules**: Enter one rule per line using `pattern => subfolder`.
      - Choose **Wildcard** (e.g., `*Control* => Controls`) or **Regex** (e.g., `^(?P<batch>[^_]+)_(\d+)\.raw$ => \g<batch>/rep_\2`).
@@ -134,6 +143,31 @@ python Waters_Integrator_plot.py
    - For **Integrated areas**, view multi-sample comparative bar plots.
    - Click **Export plot** to save the visualization to **PNG** or **SVG** format with configurable DPI resolution (72–2400 DPI).
 
+4. **Section 04 &mdash; Veusz / LabPlot Document Export**:
+   - Select a CSV folder and target output path for publication project documents (`.vsz` or `.lml`).
+   - Click **Export to Veusz (.vsz)** for clean, auto-formatted multi-page Veusz projects.
+   - Click **Launch Standalone Exporter** to open the dedicated Veusz Exporter tool with selective dataset checkboxes and embedded data options.
+
+---
+
+### Standalone Veusz Exporter Tool
+
+Launch the dedicated export workspace:
+
+```bash
+python Waters_Integrator_exporter.py
+```
+
+Or run headless batch exports from the command line:
+
+```bash
+# Export all datasets in a folder into a self-contained Veusz project
+python Waters_Integrator_exporter.py --input path/to/csvs --output Project.vsz --embed-data
+
+# Headless batch export linking external CSV files
+python Waters_Integrator_exporter.py -i path/to/csvs -o Project.vsz --link-csv
+```
+
 ---
 
 ## Integration Algorithm Details
@@ -151,13 +185,14 @@ For each target peak in window $[t_{\text{target}} - \text{tol}_-, t_{\text{targ
 
 ```text
 waters-data-extractor/
-├── Waters_Integrator_plot.py  # Main application script with PySide6 desktop GUI
-├── requirements.txt           # Python dependencies (pandas, matplotlib, PySide6, rainbow-api)
-├── pyproject.toml             # Project metadata and packaging config
-├── .gitignore                 # Git ignore file for Python and raw lab data
-├── .gitattributes             # Git line-ending and binary tracking
-├── LICENSE                    # MIT License
-└── README.md                  # Project documentation
+├── Waters_Integrator_plot.py      # Main application workspace with PySide6 desktop GUI
+├── Waters_Integrator_exporter.py  # Standalone Veusz / LabPlot document exporter & CLI
+├── requirements.txt               # Python dependencies (pandas, matplotlib, PySide6, rainbow-api)
+├── pyproject.toml                 # Project metadata and packaging config
+├── .gitignore                     # Git ignore file for Python and raw lab data
+├── .gitattributes                 # Git line-ending and binary tracking
+├── LICENSE                        # MIT License
+└── README.md                      # Project documentation
 ```
 
 ---
