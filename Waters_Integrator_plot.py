@@ -15,12 +15,13 @@ from typing import List, Optional
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import QSettings, Qt, Signal
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QObject, QSettings, Qt, Signal, QTime, QUrl, QSize
+from PySide6.QtGui import QColor, QPalette, QDesktopServices, QTextCursor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDockWidget,
     QFileDialog,
     QFrame,
     QFormLayout,
@@ -34,11 +35,13 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QSplitterHandle,
     QSpinBox,
     QStyleFactory,
     QTableWidget,
@@ -753,6 +756,47 @@ def integrate_peak_asym(times, intens, center, tol_minus, tol_plus, smooth_win=5
     return area
 
 
+class QtConsoleStream(QObject):
+    text_written = Signal(str, str)
+
+    def __init__(self, original_stream=None, stream_type="stdout"):
+        super().__init__()
+        self.original_stream = original_stream
+        self.stream_type = stream_type
+
+    @property
+    def encoding(self):
+        return getattr(self.original_stream, "encoding", "utf-8")
+
+    @property
+    def errors(self):
+        return getattr(self.original_stream, "errors", "strict")
+
+    def isatty(self):
+        return getattr(self.original_stream, "isatty", lambda: False)()
+
+    def fileno(self):
+        if hasattr(self.original_stream, "fileno"):
+            return self.original_stream.fileno()
+        raise OSError("fileno not supported")
+
+    def write(self, text):
+        if self.original_stream:
+            try:
+                self.original_stream.write(text)
+            except Exception:
+                pass
+        if text:
+            self.text_written.emit(str(text), self.stream_type)
+
+    def flush(self):
+        if self.original_stream:
+            try:
+                self.original_stream.flush()
+            except Exception:
+                pass
+
+
 class CollapsibleSection(QWidget):
     expandedChanged = Signal(object, bool)
 
@@ -787,32 +831,121 @@ class CollapsibleSection(QWidget):
         self.expandedChanged.emit(self, expanded)
 
 
+class GripSplitterHandle(QSplitterHandle):
+    """Prominent, tactile splitter handle with clear border divider and centered grip."""
+
+    def __init__(self, orientation: Qt.Orientation, parent: QSplitter):
+        super().__init__(orientation, parent)
+        self.setMouseTracking(True)
+        self._hovered = False
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+
+        # Detect light vs dark theme
+        is_dark = self.palette().window().color().lightness() < 128
+
+        # Background gutter tint
+        if self._hovered:
+            bg_color = QColor(56, 139, 253, 30) if is_dark else QColor(9, 105, 218, 25)
+        else:
+            bg_color = QColor(255, 255, 255, 12) if is_dark else QColor(0, 0, 0, 10)
+        painter.fillRect(rect, bg_color)
+
+        # Border separator lines
+        border_pen = QColor(110, 125, 145, 140) if is_dark else QColor(175, 185, 200, 180)
+        painter.setPen(QPen(border_pen, 1))
+
+        if self.orientation() == Qt.Orientation.Horizontal:
+            painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
+            painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
+
+            # Tactile center grip pill
+            mid_x = rect.center().x()
+            pill_w = 4
+            pill_h = min(42, max(24, rect.height() // 4))
+            pill_x = mid_x - pill_w // 2
+            pill_y = max(rect.top() + 6, rect.center().y() - pill_h // 2)
+
+            grip_color = (
+                QColor("#388bfd")
+                if (self._hovered and is_dark)
+                else QColor("#0969da")
+                if self._hovered
+                else QColor("#8b949e")
+                if is_dark
+                else QColor("#57606a")
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(grip_color)
+            painter.drawRoundedRect(pill_x, pill_y, pill_w, pill_h, 2, 2)
+
+            # Embossed grip dots inside pill
+            dot_color = QColor(255, 255, 255, 220) if is_dark else QColor(255, 255, 255, 240)
+            painter.setBrush(dot_color)
+            cy = rect.center().y()
+            for dy in (-10, 0, 10):
+                painter.drawEllipse(mid_x - 1, cy + dy - 1, 2, 2)
+        else:
+            painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
+            painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+
+            mid_y = rect.center().y()
+            pill_w = min(42, max(24, rect.width() // 4))
+            pill_h = 4
+            pill_x = max(rect.left() + 6, rect.center().x() - pill_w // 2)
+            pill_y = mid_y - pill_h // 2
+
+            grip_color = (
+                QColor("#388bfd")
+                if (self._hovered and is_dark)
+                else QColor("#0969da")
+                if self._hovered
+                else QColor("#8b949e")
+                if is_dark
+                else QColor("#57606a")
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(grip_color)
+            painter.drawRoundedRect(pill_x, pill_y, pill_w, pill_h, 2, 2)
+
+            dot_color = QColor(255, 255, 255, 220) if is_dark else QColor(255, 255, 255, 240)
+            painter.setBrush(dot_color)
+            cx = rect.center().x()
+            for dx in (-10, 0, 10):
+                painter.drawEllipse(cx + dx - 1, mid_y - 1, 2, 2)
+
+
+class GripSplitter(QSplitter):
+    """QSplitter configured with prominent, high-contrast GripSplitterHandle."""
+
+    def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.setHandleWidth(12)
+
+    def createHandle(self):
+        return GripSplitterHandle(self.orientation(), self)
+
+
 class MassLynxWindow(QMainWindow):
-    def __init__(self, title: str, expanded: bool = True):
+    def __init__(self, original_stream=None, stream_type="stdout"):
         super().__init__()
-        self.setObjectName("collapsibleSection")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        self.original_stream = original_stream
+        self.stream_type = stream_type
 
-        self.toggle = QToolButton()
-        self.toggle.setObjectName("sectionToggle")
-        self.toggle.setText(title)
-        self.toggle.setCheckable(True)
-        self.toggle.setChecked(expanded)
-        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
-        self.toggle.setSizePolicy(self.toggle.sizePolicy().horizontalPolicy(), self.toggle.sizePolicy().verticalPolicy())
-        layout.addWidget(self.toggle)
-
-        self.body = QWidget()
-        self.body_layout = QVBoxLayout(self.body)
-        self.body_layout.setContentsMargins(14, 10, 14, 14)
-        self.body_layout.setSpacing(10)
-        self.body.setVisible(expanded)
-        layout.addWidget(self.body)
-        self.toggle.toggled.connect(self._set_expanded)
-
+    @property
     def _build_ui(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -867,11 +1000,11 @@ class MassLynxWindow(QMainWindow):
         scroll.setWidget(content)
         self.setCentralWidget(scroll)
         self.statusBar().showMessage("Ready")
+        self._build_console_drawer()
         self.theme_style_combo.currentIndexChanged.connect(self.apply_theme)
         self.theme_mode_combo.currentIndexChanged.connect(self.apply_theme)
         QApplication.styleHints().colorSchemeChanged.connect(self.apply_theme)
         self.apply_theme()
-
     def apply_theme(self, *_args):
         app = QApplication.instance()
         mode = self.theme_mode_combo.currentData() or "system"
@@ -974,6 +1107,22 @@ class MassLynxWindow(QMainWindow):
         self.settings.setValue("theme/style", theme)
         self.settings.setValue("theme/mode", mode)
 
+        if hasattr(self, "console_text"):
+            console_bg = "#161719" if system_dark else "#fdfdfd"
+            console_border = "#35393f" if system_dark else "#d4d9df"
+            self.console_text.setStyleSheet(
+                f"QPlainTextEdit {{ background: {console_bg}; color: {colors['text']}; "
+                f"border: 1px solid {console_border}; border-radius: 6px; padding: 6px; "
+                f"font-family: Consolas, 'Cascadia Code', 'Courier New', monospace; font-size: 12px; }}"
+            )
+        if hasattr(self, "console_status_button"):
+            self.console_status_button.setStyleSheet(
+                f"QToolButton {{ padding: 3px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; "
+                f"background: {colors['button']}; color: {colors['text']}; border: 1px solid {colors['border']}; }}"
+                f"QToolButton:hover {{ background: {colors['alternate']}; }}"
+                f"QToolButton:checked {{ background: {colors['accent']}; color: {colors['accent_text']}; }}"
+            )
+
     def handle_section_expanded(self, source, expanded: bool):
         if expanded:
             for section in self.sections:
@@ -1024,11 +1173,11 @@ class MassLynxWindow(QMainWindow):
                 )
                 self.csv_preview_splitter.setSizes([controls_height, graph_height])
             else:
-                self.csv_preview_controls_panel.setMaximumWidth(380)
+                self.csv_preview_controls_panel.setMaximumWidth(16777215)
                 self.csv_preview_controls_panel.setMinimumHeight(0)
                 self.csv_preview_graph_panel.setMinimumHeight(0)
                 self.csv_preview_splitter.setMinimumHeight(0)
-                self.csv_preview_splitter.setSizes([420, 850])
+                self.csv_preview_splitter.setSizes([380, 700])
         if hasattr(self, "integration_preview_controls_layout"):
             self.integration_preview_controls_layout.setDirection(
                 QBoxLayout.Direction.TopToBottom if narrow else QBoxLayout.Direction.LeftToRight
@@ -1118,18 +1267,14 @@ class MassLynxWindow(QMainWindow):
         browse = QPushButton("Browse")
         browse.setObjectName("secondaryButton")
         browse.clicked.connect(self.browse_csv_folder)
-        open_btn = QPushButton("Open")
-        open_btn.setObjectName("secondaryButton")
-        open_btn.setToolTip("Open folder in file explorer")
-        open_btn.clicked.connect(lambda: self.open_folder_in_explorer(self.csv_folder_edit.text()))
-        folder_btn_layout = QHBoxLayout()
-        folder_btn_layout.setContentsMargins(0, 0, 0, 0)
-        folder_btn_layout.setSpacing(6)
-        folder_btn_layout.addWidget(browse)
-        folder_btn_layout.addWidget(open_btn)
+        open_folder = QPushButton("Open")
+        open_folder.setObjectName("secondaryButton")
+        open_folder.setToolTip("Open folder in file explorer")
+        open_folder.clicked.connect(lambda: self.open_folder_in_explorer(self.csv_folder_edit.text()))
         folder_row.addWidget(QLabel("CSV folder"))
         folder_row.addWidget(self.csv_folder_edit, 1)
-        folder_row.addLayout(folder_btn_layout)
+        folder_row.addWidget(browse)
+        folder_row.addWidget(open_folder)
         section.body_layout.addLayout(folder_row)
 
         preview_controls = QHBoxLayout()
@@ -1159,7 +1304,7 @@ class MassLynxWindow(QMainWindow):
         preview_controls.addWidget(refresh_samples)
         section.body_layout.addLayout(preview_controls)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = GripSplitter(Qt.Orientation.Horizontal)
         self.integration_splitter = splitter
         target_panel = QWidget()
         self.integration_target_panel = target_panel
@@ -1513,12 +1658,12 @@ class MassLynxWindow(QMainWindow):
         section = CollapsibleSection("03  CSV data preview", expanded=False)
         parent_layout.addWidget(section)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = GripSplitter(Qt.Orientation.Horizontal)
         self.csv_preview_splitter = splitter
         controls = QWidget()
         self.csv_preview_controls_panel = controls
-        controls.setMinimumWidth(220)
-        controls.setMaximumWidth(380)
+        controls.setMinimumWidth(180)
+        controls.setMaximumWidth(16777215)
         controls_layout = QFormLayout(controls)
         controls_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
@@ -1528,8 +1673,13 @@ class MassLynxWindow(QMainWindow):
         browse = QPushButton("Browse")
         browse.setObjectName("secondaryButton")
         browse.clicked.connect(self.browse_plot_folder)
+        open_plot_folder = QPushButton("Open")
+        open_plot_folder.setObjectName("secondaryButton")
+        open_plot_folder.setToolTip("Open folder in file explorer")
+        open_plot_folder.clicked.connect(lambda: self.open_folder_in_explorer(self.plot_folder_edit.text()))
         folder_row.addWidget(self.plot_folder_edit, 1)
         folder_row.addWidget(browse)
+        folder_row.addWidget(open_plot_folder)
         controls_layout.addRow("Folder", folder_row)
 
         self.plot_file_table = QTableWidget(0, 2)
@@ -1587,11 +1737,21 @@ class MassLynxWindow(QMainWindow):
         controls_layout.addRow(self.plot_status_label)
 
         self.preview_tabs = QTabWidget()
+        self.preview_tabs.setMinimumSize(50, 50)
+        self.preview_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
         plot_panel = QWidget()
         self.csv_preview_graph_panel = plot_panel
+        plot_panel.setMinimumSize(50, 50)
+        plot_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         plot_layout = QVBoxLayout(plot_panel)
         plot_layout.setContentsMargins(0, 0, 0, 0)
         self.plot_canvas = FigureCanvasQTAgg(self.figure)
+        self.plot_canvas.setMinimumSize(50, 50)
+        self.plot_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.plot_canvas.minimumSizeHint = lambda: QSize(50, 50)
+        self.plot_canvas.sizeHint = lambda: QSize(350, 200)
+
         self.plot_toolbar = NavigationToolbar2QT(self.plot_canvas, plot_panel)
         self.plot_toolbar.setVisible(False)
         self.plot_controls_checkbox.toggled.connect(self.plot_toolbar.setVisible)
@@ -1600,9 +1760,13 @@ class MassLynxWindow(QMainWindow):
         self.preview_tabs.addTab(plot_panel, "Plot preview")
 
         table_panel = QWidget()
+        table_panel.setMinimumSize(50, 50)
+        table_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         table_layout = QVBoxLayout(table_panel)
         table_layout.setContentsMargins(0, 0, 0, 0)
         self.csv_preview_table = QTableWidget(0, 0)
+        self.csv_preview_table.setMinimumSize(50, 50)
+        self.csv_preview_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.csv_preview_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.csv_preview_table.setAlternatingRowColors(True)
         self.csv_preview_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -1618,17 +1782,134 @@ class MassLynxWindow(QMainWindow):
         splitter.addWidget(self.preview_tabs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setHandleWidth(10)
+        splitter.setHandleWidth(12)
         splitter.setChildrenCollapsible(False)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
-        splitter.setSizes([260, 420])
-        splitter.handle(1).setCursor(Qt.CursorShape.SplitHCursor)
-        splitter.handle(1).setStyleSheet(
-            "QSplitter::handle { background: palette(mid); }"
-            "QSplitter::handle:hover { background: palette(highlight); }"
-        )
+        splitter.setSizes([280, 500])
         section.body_layout.addWidget(splitter, 1)
+
+    def _build_console_drawer(self):
+        self.console_dock = QDockWidget("Debug Console", self)
+        self.console_dock.setObjectName("runtimeConsoleDock")
+        self.console_dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.TopDockWidgetArea)
+        self.console_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+
+        console_container = QWidget()
+        console_layout = QVBoxLayout(console_container)
+        console_layout.setContentsMargins(10, 6, 10, 8)
+        console_layout.setSpacing(6)
+
+        toolbar_layout = QHBoxLayout()
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(8)
+
+        console_title = QLabel("Runtime Console & Diagnostics")
+        console_title.setStyleSheet("font-weight: 650; font-size: 13px;")
+        toolbar_layout.addWidget(console_title)
+
+        self.console_count_label = QLabel("0 lines")
+        self.console_count_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        toolbar_layout.addWidget(self.console_count_label)
+
+        toolbar_layout.addStretch(1)
+
+        self.console_autoscroll_checkbox = QCheckBox("Auto-scroll")
+        self.console_autoscroll_checkbox.setChecked(True)
+        toolbar_layout.addWidget(self.console_autoscroll_checkbox)
+
+        copy_btn = QPushButton("Copy all")
+        copy_btn.setObjectName("secondaryButton")
+        copy_btn.clicked.connect(self._copy_console_text)
+        toolbar_layout.addWidget(copy_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.setObjectName("secondaryButton")
+        clear_btn.clicked.connect(self._clear_console)
+        toolbar_layout.addWidget(clear_btn)
+
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setToolTip("Close console drawer")
+        close_btn.clicked.connect(self.console_dock.hide)
+        toolbar_layout.addWidget(close_btn)
+
+        console_layout.addLayout(toolbar_layout)
+
+        self.console_text = QPlainTextEdit()
+        self.console_text.setReadOnly(True)
+        self.console_text.setMaximumBlockCount(5000)
+        self.console_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        console_layout.addWidget(self.console_text, 1)
+
+        console_container.setMinimumHeight(150)
+        self.console_dock.setWidget(console_container)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.console_dock)
+        self.console_dock.setVisible(False)
+
+        self.console_status_button = QToolButton()
+        self.console_status_button.setText("Console")
+        self.console_status_button.setCheckable(True)
+        self.console_status_button.setToolTip("Toggle runtime debugging console drawer")
+        self.console_status_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.console_status_button.toggled.connect(self.console_dock.setVisible)
+        self.console_dock.visibilityChanged.connect(self.console_status_button.setChecked)
+        self.statusBar().addPermanentWidget(self.console_status_button)
+
+        self._msg_count = 0
+        self._stdout_stream = QtConsoleStream(sys.stdout, "stdout")
+        self._stderr_stream = QtConsoleStream(sys.stderr, "stderr")
+        self._stdout_stream.text_written.connect(self._handle_stream_output)
+        self._stderr_stream.text_written.connect(self._handle_stream_output)
+        sys.stdout = self._stdout_stream
+        sys.stderr = self._stderr_stream
+
+        self.log_console("Runtime debug console initialized. Capturing stdout, stderr, and operations.", "SYSTEM")
+        self.statusBar().messageChanged.connect(self._handle_status_message_changed)
+
+    def _handle_status_message_changed(self, msg: str):
+        if msg:
+            self.log_console(f"{msg}", "STATUS")
+
+    def _handle_stream_output(self, text: str, stream_type: str):
+        if not text:
+            return
+        self._append_console_output(text, stream_type)
+
+    def _append_console_output(self, text: str, stream_type: str = "stdout"):
+        self.console_text.moveCursor(QTextCursor.MoveOperation.End)
+        self.console_text.insertPlainText(text)
+        self._msg_count += text.count("\n") or 1
+        self.console_count_label.setText(f"{self._msg_count} lines")
+        if self.console_autoscroll_checkbox.isChecked():
+            self.console_text.moveCursor(QTextCursor.MoveOperation.End)
+
+    def log_console(self, text: str, level: str = "INFO"):
+        time_str = QTime.currentTime().toString("HH:mm:ss.zzz")
+        formatted = f"[{time_str}] [{level}] {text}\n"
+        self._append_console_output(formatted, level.lower())
+
+    def _clear_console(self):
+        self.console_text.clear()
+        self._msg_count = 0
+        self.console_count_label.setText("0 lines")
+
+    def _copy_console_text(self):
+        text = self.console_text.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.statusBar().showMessage("Console output copied to clipboard", 3000)
+
+    def closeEvent(self, event):
+        if hasattr(self, "_stdout_stream") and self._stdout_stream.original_stream:
+            sys.stdout = self._stdout_stream.original_stream
+        if hasattr(self, "_stderr_stream") and self._stderr_stream.original_stream:
+            sys.stderr = self._stderr_stream.original_stream
+        super().closeEvent(event)
 
     def browse_raw_root(self):
         folder = QFileDialog.getExistingDirectory(self, "Select root folder with .raw runs")
@@ -2153,6 +2434,11 @@ class MassLynxWindow(QMainWindow):
         if not 72 <= dpi <= 2400:
             raise ValueError("Export DPI must be between 72 and 2400.")
         self.figure.savefig(filename, format=extension[1:], bbox_inches="tight", dpi=dpi)
+
+
+# ---------------------------
+# Run
+# ---------------------------
 
 
 # ---------------------------
