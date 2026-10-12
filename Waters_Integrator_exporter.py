@@ -510,7 +510,10 @@ def generate_veusz_vsz_project(
         # Ingestion of datasets
         if embed_data:
             if x_type == "text":
-                text_vals = [str(v).replace("\\", "\\\\").replace("'", "\\'") for v in df[x_col].fillna("").tolist()]
+                text_vals = []
+                for v in df[x_col].fillna("").tolist():
+                    clean_val = str(v).replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
+                    text_vals.append(f'%{{{{ESCAPE("{clean_val}")}}}}%')
                 text_vals_str = ", ".join(f"'{v}'" for v in text_vals)
                 lines.append(f"SetDataText('{ds_x_name}', [{text_vals_str}])")
             else:
@@ -630,6 +633,8 @@ def generate_veusz_vsz_project(
                 lines.append("Set('mode', 'grouped')")
                 lines.append("Set('barfill', 0.8)")
                 lines.append("Set('groupfill', 0.85)")
+                bar_fills = [("solid", VEUSZ_PALETTE[i % len(VEUSZ_PALETTE)], False) for i in range(len(y_cols))]
+                lines.append(f"Set('BarFill/fills', {bar_fills})")
                 lines.append("To('..')")
             else:
                 # XY Plot Curves for Chromatograms
@@ -1616,12 +1621,17 @@ class WatersExporterWindow(QMainWindow):
         folder = text.strip()
         if folder and os.path.isdir(folder):
             self.settings.setValue("last_folder", folder)
-            if not self.output_edit.text().strip():
-                default_out = os.path.join(folder, "Waters_Veusz_Project.vsz")
+            folder_name = os.path.basename(os.path.normpath(folder)) or "export"
+            default_out = os.path.join(folder, f"Waters_{folder_name}_export.vsz")
+            curr_text = self.output_edit.text().strip()
+            if not curr_text or "waters_veusz_project" in curr_text.lower() or "waters_labplot_project" in curr_text.lower() or curr_text.endswith("_export.vsz"):
                 self.output_edit.setText(default_out)
 
     def browse_output_file(self):
-        current_out = self.output_edit.text().strip() or "Waters_Veusz_Project.vsz"
+        folder = self.csv_folder_edit.text().strip()
+        folder_name = os.path.basename(os.path.normpath(folder)) if folder else "export"
+        default_name = f"Waters_{folder_name}_export.vsz"
+        current_out = self.output_edit.text().strip() or os.path.join(folder or ".", default_name)
         filters = "Veusz Project (*.vsz);;All Files (*.*)"
         filename, _ = QFileDialog.getSaveFileName(self, "Select Veusz project output path", current_out, filters)
         if filename:
@@ -1759,8 +1769,10 @@ class WatersExporterWindow(QMainWindow):
             return
 
         output_path = self.output_edit.text().strip()
-        if not output_path:
-            output_path = os.path.join(folder, "Waters_Veusz_Project.vsz")
+        folder_name = os.path.basename(os.path.normpath(folder)) or "export"
+        default_name = f"Waters_{folder_name}_export.vsz"
+        if not output_path or "waters_veusz_project" in output_path.lower():
+            output_path = os.path.join(folder, default_name)
             self.output_edit.setText(output_path)
 
         add_plots = self.add_plots_checkbox.isChecked()
@@ -1828,7 +1840,8 @@ class WatersExporterWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid folder", "Select a valid CSV folder first.")
             return
 
-        out_path = os.path.join(folder, "Waters_LabPlot_Project.lml")
+        folder_name = os.path.basename(os.path.normpath(folder)) or "export"
+        out_path = os.path.join(folder, f"Waters_{folder_name}_export.lml")
         filename, _ = QFileDialog.getSaveFileName(self, "Save Legacy LabPlot Project", out_path, "LabPlot Project (*.lml)")
         if not filename:
             return
@@ -1882,7 +1895,8 @@ def main():
         csv_files = find_chrom_csv_files(args.folder, include_evaluated=include_eval)
         print(f"Discovered {len(csv_files)} datasets in {args.folder}")
 
-        base_out = args.output or os.path.join(args.folder, "Waters_Veusz_Project.vsz")
+        folder_name = os.path.basename(os.path.normpath(args.folder)) or "export"
+        base_out = args.output or os.path.join(args.folder, f"Waters_{folder_name}_export.vsz")
         res = create_veusz_project(
             csv_folder=args.folder,
             output_path=base_out,

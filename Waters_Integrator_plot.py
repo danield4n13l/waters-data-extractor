@@ -2191,15 +2191,20 @@ class MassLynxWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select folder with CSV datasets")
         if folder:
             self.labplot_folder_edit.setText(folder)
-            if not self.labplot_output_edit.text().strip():
-                self.labplot_output_edit.setText(os.path.join(folder, "Waters_Veusz_Project.vsz"))
+            folder_name = os.path.basename(os.path.normpath(folder)) or "export"
+            curr = self.labplot_output_edit.text().strip()
+            if not curr or "waters_veusz_project" in curr.lower() or "waters_labplot_project" in curr.lower() or curr.endswith("_export.vsz"):
+                self.labplot_output_edit.setText(os.path.join(folder, f"Waters_{folder_name}_export.vsz"))
 
     def browse_labplot_output(self):
         filters = "Veusz Project (*.vsz);;LabPlot Project (Deprecated) (*.lml);;All Files (*.*)"
+        folder = self.labplot_folder_edit.text().strip() or self.csv_folder_edit.text().strip()
+        folder_name = os.path.basename(os.path.normpath(folder)) if folder else "export"
+        default_file = self.labplot_output_edit.text().strip() or os.path.join(folder or ".", f"Waters_{folder_name}_export.vsz")
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Select project output path",
-            self.labplot_output_edit.text().strip() or "Waters_Veusz_Project.vsz",
+            default_file,
             filters,
         )
         if filename:
@@ -2218,8 +2223,9 @@ class MassLynxWindow(QMainWindow):
             return
 
         output_path = self.labplot_output_edit.text().strip()
+        folder_name = os.path.basename(os.path.normpath(csv_folder)) or "export"
         if not output_path or output_path.casefold().endswith(".vsz"):
-            base_name = os.path.splitext(output_path)[0] if output_path else "Waters_LabPlot_Project"
+            base_name = os.path.splitext(output_path)[0] if output_path else f"Waters_{folder_name}_export"
             output_path = (os.path.join(csv_folder, f"{os.path.basename(base_name)}.lml")
                            if not os.path.isabs(base_name) else f"{base_name}.lml")
             self.labplot_output_edit.setText(output_path)
@@ -2266,12 +2272,10 @@ class MassLynxWindow(QMainWindow):
             return
 
         output_path = self.labplot_output_edit.text().strip()
-        if not output_path or output_path.casefold().endswith((".lml", ".lml.gz", ".py")):
-            base_name = os.path.splitext(output_path)[0] if output_path else "Waters_Veusz_Project"
-            if base_name.casefold().endswith(".lml"):
-                base_name = base_name[:-4]
-            output_path = (os.path.join(csv_folder, f"{os.path.basename(base_name)}.vsz")
-                           if not os.path.isabs(base_name) else f"{base_name}.vsz")
+        folder_name = os.path.basename(os.path.normpath(csv_folder)) or "export"
+        default_name = f"Waters_{folder_name}_export.vsz"
+        if not output_path or output_path.casefold().endswith((".lml", ".lml.gz", ".py")) or "waters_veusz_project" in output_path.lower() or "waters_labplot_project" in output_path.lower():
+            output_path = os.path.join(csv_folder, default_name)
             self.labplot_output_edit.setText(output_path)
 
         add_plots = self.labplot_add_plots_checkbox.isChecked()
@@ -2720,7 +2724,8 @@ class MassLynxWindow(QMainWindow):
         self.csv_folder_edit.setText(chrom_dir)
         self.plot_folder_edit.setText(chrom_dir)
         self.labplot_folder_edit.setText(chrom_dir)
-        self.labplot_output_edit.setText(os.path.join(chrom_dir, "Waters_LabPlot_Project.lml"))
+        folder_name = os.path.basename(os.path.normpath(chrom_dir)) or "export"
+        self.labplot_output_edit.setText(os.path.join(chrom_dir, f"Waters_{folder_name}_export.vsz"))
         self.refresh_plot_files()
         self.refresh_integration_preview_files()
         self.refresh_raw_preview()
@@ -2739,7 +2744,8 @@ class MassLynxWindow(QMainWindow):
         if folder:
             self.csv_folder_edit.setText(folder)
             self.labplot_folder_edit.setText(folder)
-            self.labplot_output_edit.setText(os.path.join(folder, "Waters_LabPlot_Project.lml"))
+            folder_name = os.path.basename(os.path.normpath(folder)) or "export"
+            self.labplot_output_edit.setText(os.path.join(folder, f"Waters_{folder_name}_export.vsz"))
             self.refresh_integration_preview_files()
 
     def add_target(self):
