@@ -261,12 +261,9 @@ def iter_raw_dirs(root: str) -> List[str]:
 def _safe_parse_function(dat_path: str, prec: int = 0):
     """Call masslynx.parse_function safely across different rainbow library versions."""
     try:
-        return masslynx.parse_function(str(dat_path), display_precision=prec)
+        return masslynx.parse_function(str(dat_path), prec=prec)
     except TypeError:
-        try:
-            return masslynx.parse_function(str(dat_path), prec=prec)
-        except TypeError:
-            return masslynx.parse_function(str(dat_path))
+        return masslynx.parse_function(str(dat_path))
 
 
 def process_func001(dat_path: str, base_name: str, mz_dir: str, tic_dir: str, prec: int = 0):
@@ -762,7 +759,7 @@ def integrate_peak_asym(times, intens, center, tol_minus, tol_plus, smooth_win=5
 
 
 # ---------------------------
-# KDE LabPlot export helpers (imported from Waters_LabPlot_Exporter)
+# Waters Exporter helpers (imported from Waters_Integrator_exporter)
 # ---------------------------
 
 try:
@@ -772,9 +769,13 @@ try:
         generate_labplot_lml_project,
         create_veusz_project,
         generate_veusz_vsz_project,
+        WatersExporterWindow,
         LabPlotExporterWindow,
     )
 except ImportError:
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    if _script_dir not in sys.path:
+        sys.path.insert(0, _script_dir)
     try:
         from Waters_Integrator_exporter import (
             create_labplot_project,
@@ -782,30 +783,11 @@ except ImportError:
             generate_labplot_lml_project,
             create_veusz_project,
             generate_veusz_vsz_project,
+            WatersExporterWindow,
             LabPlotExporterWindow,
         )
     except ImportError:
-        _script_dir = os.path.dirname(os.path.abspath(__file__))
-        if _script_dir not in sys.path:
-            sys.path.insert(0, _script_dir)
-        try:
-            from Waters_Integrator_exporter import (
-                create_labplot_project,
-                export_labplot_script,
-                generate_labplot_lml_project,
-                create_veusz_project,
-                generate_veusz_vsz_project,
-                LabPlotExporterWindow,
-            )
-        except ImportError:
-            from Waters_Integrator_exporter import (
-                create_labplot_project,
-                export_labplot_script,
-                generate_labplot_lml_project,
-                create_veusz_project,
-                generate_veusz_vsz_project,
-                LabPlotExporterWindow,
-            )
+        pass
 
 
 
@@ -1961,9 +1943,9 @@ class MassLynxWindow(QMainWindow):
         export_veusz_button.clicked.connect(self.export_veusz_clicked)
         action_layout.addWidget(export_veusz_button)
 
-        open_standalone_btn = QPushButton("Open Standalone Veusz Exporter…")
+        open_standalone_btn = QPushButton("Open Standalone Waters Exporter…")
         open_standalone_btn.setObjectName("secondaryButton")
-        open_standalone_btn.setToolTip("Open full standalone Veusz Exporter window with dataset selection, preview, and options")
+        open_standalone_btn.setToolTip("Open full standalone Waters Exporter window with dataset selection, preview, and options")
         open_standalone_btn.clicked.connect(self.open_standalone_labplot_exporter)
         action_layout.addWidget(open_standalone_btn)
 
@@ -1981,8 +1963,8 @@ class MassLynxWindow(QMainWindow):
 
     def open_standalone_labplot_exporter(self):
         folder = self.labplot_folder_edit.text().strip() or self.csv_folder_edit.text().strip()
-        console_log(f"Launching standalone Veusz Exporter window (folder='{folder}')", category="UI-EXPORTER")
-        self._labplot_exporter_window = LabPlotExporterWindow(initial_folder=folder if os.path.isdir(folder) else None)
+        console_log(f"Launching standalone Waters Exporter window (folder='{folder}')", category="UI-EXPORTER")
+        self._labplot_exporter_window = WatersExporterWindow(initial_folder=folder if os.path.isdir(folder) else None)
         self._labplot_exporter_window.show()
 
     def browse_labplot_folder(self):

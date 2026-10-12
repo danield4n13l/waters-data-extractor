@@ -5,7 +5,7 @@
 Waters Exporter
 ---------------------
 Dedicated standalone tool and GUI for exporting MassLynx / chromatographic
-CSV datasets into publication-ready Veusz project documents (.vsz).
+CSV datasets into publication-ready plotting projects (Veusz, etc.).
 
 Note on KDE LabPlot:
 KDE LabPlot support has been deprecated in favor of the modernized,
@@ -974,19 +974,24 @@ class GripSplitter(QSplitter):
         return GripSplitterHandle(self.orientation(), self)
 
 
-class LabPlotExporterWindow(QMainWindow):
+class WatersExporterWindow(QMainWindow):
     """
-    Main application window for Veusz project generation.
-    (Retains class name LabPlotExporterWindow for compatibility with caller scripts).
+    Main application window for Waters dataset export and project generation.
     """
 
     def __init__(self, initial_folder: Optional[str] = None):
         super().__init__()
         self.setWindowTitle("Waters Exporter | Chromatographic workspace")
-        self.resize(1140, 860)
-        self.setMinimumSize(680, 480)
+        self.resize(960, 720)
+        self.setMinimumSize(640, 480)
 
-        self.settings = QSettings("danield4n13l", "WatersVeuszExporter")
+        self.settings = QSettings("danield4n13l", "WatersExporter")
+        # Migrate legacy settings from WatersVeuszExporter if empty
+        if not self.settings.allKeys():
+            legacy_settings = QSettings("danield4n13l", "WatersVeuszExporter")
+            for key in legacy_settings.allKeys():
+                self.settings.setValue(key, legacy_settings.value(key))
+
         self.native_style_name = QApplication.style().objectName()
         self.system_palette = QPalette(QApplication.palette())
         self.discovered_csv_files: List[Tuple[str, str]] = []
@@ -1001,7 +1006,7 @@ class LabPlotExporterWindow(QMainWindow):
             self.csv_folder_edit.setText(str(initial))
             self.scan_datasets()
 
-        console_log("Waters Exporter initialized (Veusz standard 3.6+)", category="INIT")
+        console_log("Waters Exporter initialized", category="INIT")
         if self.veusz_bin:
             console_log(f"Detected Veusz binary on system: {self.veusz_bin}", category="INIT")
 
@@ -1022,7 +1027,7 @@ class LabPlotExporterWindow(QMainWindow):
         # Header: Title & Subtitle + Theme Selector
         title = QLabel("Waters Exporter")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("Package MassLynx and chromatographic CSV datasets into publication-ready Veusz project documents (.vsz).")
+        subtitle = QLabel("Package MassLynx and chromatographic CSV datasets into publication-ready export documents and projects.")
         subtitle.setObjectName("pageSubtitle")
         heading = QVBoxLayout()
         heading.addWidget(title)
@@ -1524,7 +1529,7 @@ class LabPlotExporterWindow(QMainWindow):
         sys.stdout = self._stdout_stream
         sys.stderr = self._stderr_stream
 
-        self.log_console("Veusz Exporter runtime debug console initialized.", "SYSTEM")
+        self.log_console("Waters Exporter runtime debug console initialized.", "SYSTEM")
         self.statusBar().messageChanged.connect(self._handle_status_message_changed)
 
     def _handle_status_message_changed(self, msg: str):
@@ -1837,13 +1842,17 @@ class LabPlotExporterWindow(QMainWindow):
             QMessageBox.critical(self, "LabPlot Export Failed", str(exc))
 
 
+# Backward compatibility alias
+LabPlotExporterWindow = WatersExporterWindow
+
+
 # ---------------------------
 # CLI & Standalone Runner
 # ---------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Export MassLynx / chromatographic CSV datasets to modern Veusz (.vsz) projects."
+        description="Waters Exporter: Export MassLynx / chromatographic CSV datasets to publication-ready export projects (Veusz, etc.)."
     )
     parser.add_argument("folder", nargs="?", default=None, help="Path to folder containing CSV files")
     parser.add_argument("-o", "--output", default=None, help="Output project path (.vsz)")
@@ -1886,7 +1895,7 @@ def main():
 
     # GUI Mode
     qt_app = QApplication(sys.argv)
-    window = LabPlotExporterWindow(initial_folder=args.folder)
+    window = WatersExporterWindow(initial_folder=args.folder)
     if args.output:
         window.output_edit.setText(args.output)
     if args.no_plots:

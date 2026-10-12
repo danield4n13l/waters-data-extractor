@@ -158,7 +158,7 @@ python Waters_Integrator_plot.py
 4. **Section 04 &mdash; Veusz / LabPlot Document Export**:
    - Select a CSV folder and target output path for publication project documents (`.vsz` or `.lml`).
    - Click **Export to Veusz (.vsz)** for clean, auto-formatted multi-page Veusz projects.
-   - Click **Launch Standalone Exporter** to open the dedicated Veusz Exporter tool with selective dataset checkboxes and embedded data options.
+   - Click **Launch Standalone Exporter** to open the dedicated Waters Exporter tool with selective dataset checkboxes and embedded data options.
 
 ---
 
