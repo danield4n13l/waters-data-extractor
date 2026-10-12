@@ -68,10 +68,10 @@ sequenceDiagram
 ```
 
 **Task Checklist:**
-- [ ] Create `core/workers.py` with `ExtractionWorker(QRunnable)` and `IntegrationWorker(QRunnable)`.
-- [ ] Implement an `AbortFlag` / atomic cancellation token to allow users to stop long extraction runs cleanly.
-- [ ] Add a `QProgressBar` and `Abort` button to the main status bar for extraction and batch integration.
-- [ ] Move CSV loading in Section 03 (`load_plot_csv`) to a lightweight background task so opening a 100 MB m/z file does not freeze the interface.
+- [x] Create `ExtractionWorker(QRunnable)` and `IntegrationWorker(QRunnable)` (implemented in Part 6 of AIO script).
+- [x] Implement an `AbortFlag` / atomic cancellation token (`CancellationToken`) to allow users to stop long extraction runs cleanly.
+- [x] Add a `QProgressBar` and `Abort` button to the main status bar for extraction and batch integration.
+- [x] Move CSV loading in Section 03 (`load_plot_csv`) to a lightweight background task (`CsvLoaderWorker`) so opening a 100 MB m/z file does not freeze the interface.
 
 ---
 

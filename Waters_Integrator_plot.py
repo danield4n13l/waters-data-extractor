@@ -13,12 +13,23 @@ import datetime
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import subprocess
-from typing import List, Optional
+import threading
+from typing import List, Optional, Tuple, Dict, Any, Callable
 
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import QObject, QSettings, Qt, Signal, QTime, QUrl, QSize
+from PySide6.QtCore import (
+    QObject,
+    QSettings,
+    Qt,
+    Signal,
+    QTime,
+    QUrl,
+    QSize,
+    QRunnable,
+    QThreadPool,
+)
 from PySide6.QtGui import (
     QColor,
     QPalette,
@@ -49,6 +60,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -68,9 +80,9 @@ from PySide6.QtWidgets import (
 )
 from rainbow.waters import masslynx
 
-# ---------------------------
-# Utility helpers & logging
-# ---------------------------
+# =============================================================================
+# PART 1: LOGGING, PERSISTENCE & UTILITY CORE
+# =============================================================================
 
 def console_log(message: str, category: str = "APP", level: str = "INFO"):
     """
@@ -222,9 +234,9 @@ def record_processed_runs(run_items: List[tuple]):
     console_log(f"Recorded {len(run_items)} raw run(s) in processed history database", category="HISTORY")
 
 
-# ---------------------------
-# Console syntax highlighting
-# ---------------------------
+# =============================================================================
+# PART 2: CONSOLE LOG HIGHLIGHTING & PARSING UTILITIES
+# =============================================================================
 
 class ConsoleLogHighlighter(QSyntaxHighlighter):
     """
@@ -415,9 +427,9 @@ def match_group(raw_name: str, rules: List[tuple], match_mode: str) -> Optional[
     return None
 
 
-# ---------------------------
-# MassLynx extraction helpers
-# ---------------------------
+# =============================================================================
+# PART 3: RAW DATA EXTRACTION & MASSLYNX PARSER CORE
+# =============================================================================
 
 def iter_raw_dirs(root: str) -> List[str]:
     """
@@ -560,6 +572,7 @@ def extract_masslynx_folder(
     group_rules: Optional[List[tuple]] = None,
     match_mode: str = "Regex",
     run_items: Optional[List[tuple]] = None,
+    token: Optional["CancellationToken"] = None,
 ) -> str:
     """
     Extract MassLynx .raw folders beneath 'root' into:
@@ -569,6 +582,7 @@ def extract_masslynx_folder(
 
     If run_items is provided, only extracts the specified [(raw_dir, dest_override), ...] entries.
     Returns the path to the chromatographic folder (chrom_dir).
+    Supports thread-safe cancellation via CancellationToken.
     """
     root = os.path.abspath(root)
     out_root = os.path.join(root, "csvs")
@@ -595,19 +609,31 @@ def extract_masslynx_folder(
         console_log(f"Merge wavelengths requested: {', '.join(merge_wavelengths)} nm", category="EXTRACT")
 
     if status_cb:
-        status_cb(f"Extracting {len(target_runs)} .raw folder(s)...")
+        try:
+            status_cb("Starting extraction...", 0, len(target_runs))
+        except TypeError:
+            status_cb(f"Extracting {len(target_runs)} .raw folder(s)...")
 
     processed = 0
     failed = 0
     successfully_processed = []
 
     for idx, (raw_dir, dest_override) in enumerate(target_runs):
+        if token and token.is_cancelled():
+            console_log(f"Extraction aborted by user after {processed} sample(s).", category="EXTRACT", level="WARN")
+            if successfully_processed:
+                record_processed_runs(successfully_processed)
+            raise InterruptedError("Extraction aborted by user.")
+
         base_raw = os.path.basename(raw_dir)
         base_name = base_raw[:-4] if base_raw.lower().endswith(".raw") else base_raw
         base_name = sanitize_filename(base_name, default="sample")
 
         if status_cb:
-            status_cb(f"[{idx+1}/{len(target_runs)}] {base_raw}")
+            try:
+                status_cb(base_raw, idx + 1, len(target_runs))
+            except TypeError:
+                status_cb(f"[{idx+1}/{len(target_runs)}] {base_raw}")
 
         func001 = None
         func002 = None
@@ -655,14 +681,17 @@ def extract_masslynx_folder(
 
     msg = f"Done: processed {processed}, failed {failed}."
     if status_cb:
-        status_cb(msg)
+        try:
+            status_cb(msg, processed, len(target_runs))
+        except TypeError:
+            status_cb(msg)
     console_log(f"Extraction completed: {processed} succeeded, {failed} failed. Chromatogram output: {chrom_dir}", category="EXTRACT")
     return chrom_dir
 
 
-# ---------------------------
-# Integration helpers
-# ---------------------------
+# =============================================================================
+# PART 4: CHROMATOGRAPHIC ANALYSIS & PEAK INTEGRATION CORE
+# =============================================================================
 
 def read_chrom_csv(path: str):
     """
@@ -952,9 +981,67 @@ def integrate_peak_asym(times, intens, center, tol_minus, tol_plus, smooth_win=5
     return area
 
 
-# ---------------------------
-# Waters Exporter helpers (imported from Waters_Integrator_exporter)
-# ---------------------------
+def execute_peak_integration(
+    csv_folder: str,
+    files: List[Tuple[str, str]],
+    targets: List[Tuple[float, float, float]],
+    status_cb=None,
+    token: Optional["CancellationToken"] = None,
+) -> Tuple[str, int, int]:
+    """
+    Execute batch asymmetric peak integration across a list of chromatogram CSVs.
+    Returns (output_path, processed_files_count, total_rows_count).
+    Supports status callbacks and atomic cancellation via CancellationToken.
+    """
+    total_files = len(files)
+    headers = ["Sample"] + [f"{center:.3f} min" for center, _, _ in targets]
+    rows = []
+    processed = 0
+
+    for idx, (sample_name, path) in enumerate(files):
+        if token and token.is_cancelled():
+            console_log(f"Peak integration aborted by user after {processed} sample(s).", category="UI-INTEGRATE", level="WARN")
+            raise InterruptedError("Peak integration aborted by user.")
+
+        if status_cb:
+            try:
+                status_cb(sample_name, idx + 1, total_files)
+            except TypeError:
+                status_cb(f"[{idx+1}/{total_files}] {sample_name}")
+
+        try:
+            channels = read_chrom_csv_channels(path)
+            if not channels:
+                raise ValueError("Empty or invalid chromatogram")
+            for channel_name, times, intensities in channels:
+                areas = [
+                    integrate_peak_asym(times, intensities, center, tol_minus, tol_plus, smooth_win=5)
+                    for center, tol_minus, tol_plus in targets
+                ]
+                name = sample_name
+                if len(channels) > 1:
+                    name = f"{sample_name}_{channel_name.replace(' ', '')}"
+                area_strs = [f"{area:.6g}" for area in areas]
+                rows.append({"Sample": name, **{header: val for header, val in zip(headers[1:], area_strs)}})
+                area_log = ", ".join(f"{c:.3f}m={a:.4g}" for (c, _, _), a in zip(targets, areas))
+                console_log(f"Integrated '{name}': {area_log}", category="UI-INTEGRATE")
+            processed += 1
+        except Exception as exc:
+            console_log(f"Integration error for '{sample_name}': {exc}", category="UI-INTEGRATE", level="WARN")
+            rows.append({"Sample": sample_name, **{header: "0" for header in headers[1:]}})
+
+    output_path = os.path.join(csv_folder, "00_evaluated_data.csv")
+    with open(output_path, "w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+    console_log(f"Saved evaluation summary to: {output_path} ({len(rows)} sample/channel rows, {len(targets)} targets)", category="UI-INTEGRATE")
+    return output_path, processed, len(rows)
+
+
+# =============================================================================
+# PART 5: EXTERNAL EXPORTER BRIDGES (VEUSZ / LABPLOT)
+# =============================================================================
 
 try:
     from Waters_Integrator_exporter import (
@@ -984,11 +1071,160 @@ except ImportError:
         pass
 
 
+# =============================================================================
+# PART 6: MULTI-THREADING ENGINE & ASYNCHRONOUS WORKERS (QThreadPool / QRunnable)
+# =============================================================================
+
+class CancellationToken:
+    """Thread-safe cancellation token / atomic abort flag for asynchronous tasks."""
+    def __init__(self):
+        self._event = threading.Event()
+
+    def cancel(self):
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def reset(self):
+        self._event.clear()
 
 
-# ---------------------------
-# GUI
-# ---------------------------
+class WorkerSignals(QObject):
+    """
+    Standardized Qt signal carrier for QRunnable workers.
+    Enables safe cross-thread queued signal-slot dispatching to the main GUI thread.
+    """
+    progress = Signal(int, int, str)        # current, total, status_text/sample_name
+    log = Signal(str, str, str)             # message, category, level
+    error = Signal(str)                     # error description
+    finished = Signal(object)               # result payload dict
+    cancelled = Signal()                    # triggered on graceful abort
+
+
+class ExtractionWorker(QRunnable):
+    """
+    Background worker for parsing and extracting MassLynx .raw directories.
+    Runs on QThreadPool without blocking the GUI event loop.
+    """
+    def __init__(
+        self,
+        root: str,
+        prec: int = 0,
+        merge_wavelengths: Optional[List[str]] = None,
+        group_rules: Optional[List[tuple]] = None,
+        match_mode: str = "Regex",
+        run_items: Optional[List[tuple]] = None,
+        token: Optional[CancellationToken] = None,
+    ):
+        super().__init__()
+        self.root = root
+        self.prec = prec
+        self.merge_wavelengths = merge_wavelengths
+        self.group_rules = group_rules
+        self.match_mode = match_mode
+        self.run_items = run_items
+        self.token = token or CancellationToken()
+        self.signals = WorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            chrom_dir = extract_masslynx_folder(
+                root=self.root,
+                status_cb=lambda name, cur, tot: self.signals.progress.emit(cur, tot, name),
+                prec=self.prec,
+                merge_wavelengths=self.merge_wavelengths,
+                group_rules=self.group_rules,
+                match_mode=self.match_mode,
+                run_items=self.run_items,
+                token=self.token,
+            )
+            if self.token.is_cancelled():
+                self.signals.cancelled.emit()
+            else:
+                self.signals.finished.emit({"chrom_dir": chrom_dir})
+        except InterruptedError:
+            self.signals.cancelled.emit()
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+
+
+class IntegrationWorker(QRunnable):
+    """
+    Background worker for batch peak integration across CSV files.
+    Runs on QThreadPool without freezing the GUI.
+    """
+    def __init__(
+        self,
+        csv_folder: str,
+        files: List[Tuple[str, str]],
+        targets: List[Tuple[float, float, float]],
+        token: Optional[CancellationToken] = None,
+    ):
+        super().__init__()
+        self.csv_folder = csv_folder
+        self.files = files
+        self.targets = targets
+        self.token = token or CancellationToken()
+        self.signals = WorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            output_path, processed, row_count = execute_peak_integration(
+                csv_folder=self.csv_folder,
+                files=self.files,
+                targets=self.targets,
+                status_cb=lambda name, cur, tot: self.signals.progress.emit(cur, tot, name),
+                token=self.token,
+            )
+            if self.token.is_cancelled():
+                self.signals.cancelled.emit()
+            else:
+                self.signals.finished.emit({
+                    "output_path": output_path,
+                    "processed": processed,
+                    "total": len(self.files),
+                    "row_count": row_count,
+                })
+        except InterruptedError:
+            self.signals.cancelled.emit()
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+
+
+class CsvLoaderWorker(QRunnable):
+    """
+    Lightweight background worker for reading CSV datasets asynchronously.
+    Prevents UI stutter when inspecting large chromatographic or m/z files.
+    """
+    def __init__(self, path: str, request_id: int, row_index: int):
+        super().__init__()
+        self.path = path
+        self.request_id = request_id
+        self.row_index = row_index
+        self.signals = WorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            frame = pd.read_csv(self.path)
+            self.signals.finished.emit({
+                "frame": frame,
+                "path": self.path,
+                "request_id": self.request_id,
+                "row_index": self.row_index,
+            })
+        except Exception as exc:
+            self.signals.error.emit(f"{exc}:::path:::{self.path}:::req:::{self.request_id}")
+
+
+# =============================================================================
+# PART 7: PYQT/PYSIDE UI COMPONENTS & MAIN WORKSPACE WINDOW
+# =============================================================================
+
+# --- 7.1 Console Stream & Terminal Interceptor ---
 class QtConsoleStream(QObject):
     text_written = Signal(str, str)
 
@@ -1217,7 +1453,20 @@ class MassLynxWindow(QMainWindow):
         self.figure = Figure(figsize=(8, 4), dpi=100, constrained_layout=True)
         self.axes = self.figure.add_subplot(111)
 
+        # Asynchronous multi-threading thread pool and task tokens
+        self.thread_pool = QThreadPool.globalInstance()
+        self.active_cancellation_token: Optional[CancellationToken] = None
+        self._csv_load_request_id: int = 0
+
         self._build_ui()
+
+    def closeEvent(self, event):
+        """Ensure active background workers are cancelled gracefully before closing."""
+        if self.active_cancellation_token and not self.active_cancellation_token.is_cancelled():
+            console_log("Cancelling background tasks on window close.", category="SHUTDOWN")
+            self.active_cancellation_token.cancel()
+            self.thread_pool.waitForDone(500)
+        super().closeEvent(event)
         console_log(
             f"MassLynx workspace initialized | Config: {self.settings_json_path} "
             f"({len(self.templates)} templates, {len(self.recent_targets)} recent targets loaded)",
@@ -1279,6 +1528,29 @@ class MassLynxWindow(QMainWindow):
         scroll.setWidget(content)
         self.setCentralWidget(scroll)
         self._build_console_drawer()
+
+        # Status bar progress and cancellation controls
+        self.status_progress = QProgressBar()
+        self.status_progress.setRange(0, 100)
+        self.status_progress.setValue(0)
+        self.status_progress.setTextVisible(True)
+        self.status_progress.setFixedWidth(160)
+        self.status_progress.setFixedHeight(18)
+        self.status_progress.setVisible(False)
+
+        self.status_abort_btn = QPushButton("Abort")
+        self.status_abort_btn.setFixedHeight(22)
+        self.status_abort_btn.setStyleSheet(
+            "QPushButton { background: #d9534f; color: white; font-weight: bold; font-size: 11px; padding: 2px 10px; border-radius: 4px; }"
+            "QPushButton:hover { background: #c9302c; }"
+            "QPushButton:disabled { background: #888888; color: #cccccc; }"
+        )
+        self.status_abort_btn.setVisible(False)
+        self.status_abort_btn.clicked.connect(self.abort_active_task)
+
+        self.statusBar().addPermanentWidget(self.status_progress)
+        self.statusBar().addPermanentWidget(self.status_abort_btn)
+
         self.statusBar().showMessage("Ready")
         self.theme_style_combo.currentIndexChanged.connect(self.apply_theme)
         self.theme_mode_combo.currentIndexChanged.connect(self.apply_theme)
@@ -1556,9 +1828,9 @@ class MassLynxWindow(QMainWindow):
         self.wildcard_radio.toggled.connect(self._update_auto_destinations)
         self.regex_radio.toggled.connect(self._update_auto_destinations)
 
-        extract_button = QPushButton("Extract files")
-        extract_button.clicked.connect(self.extract_clicked)
-        section.body_layout.addWidget(extract_button, 0, Qt.AlignmentFlag.AlignRight)
+        self.extract_button = QPushButton("Extract files")
+        self.extract_button.clicked.connect(self.extract_clicked)
+        section.body_layout.addWidget(self.extract_button, 0, Qt.AlignmentFlag.AlignRight)
 
     def _build_integration_section(self, parent_layout):
         section = CollapsibleSection("02  Peak integration", expanded=False)
@@ -1650,11 +1922,11 @@ class MassLynxWindow(QMainWindow):
         delete_target = QPushButton("Delete selected")
         delete_target.setObjectName("secondaryButton")
         delete_target.clicked.connect(self.delete_selected_targets)
-        run_integration = QPushButton("Integrate CSVs")
-        run_integration.clicked.connect(self.integrate_clicked)
+        self.run_integration_button = QPushButton("Integrate CSVs")
+        self.run_integration_button.clicked.connect(self.integrate_clicked)
         target_actions.addWidget(delete_target)
         target_actions.addStretch(1)
-        target_actions.addWidget(run_integration)
+        target_actions.addWidget(self.run_integration_button)
         target_row.addLayout(target_actions)
         target_layout.addLayout(target_row)
         splitter.addWidget(target_panel)
@@ -2704,40 +2976,74 @@ class MassLynxWindow(QMainWindow):
             f"Match mode: {self.current_match_mode()} | Rules: {len(rules)} | Merge wavelengths: {merge_wavelengths or 'none'}",
             category="UI-EXTRACT",
         )
-        self.statusBar().showMessage("Extracting RAW files...")
-        QApplication.processEvents()
-        try:
-            chrom_dir = extract_masslynx_folder(
-                root,
-                status_cb=lambda message: self.statusBar().showMessage(message),
-                prec=0,
-                merge_wavelengths=merge_wavelengths,
-                group_rules=rules,
-                match_mode=self.current_match_mode(),
-                run_items=run_items,
-            )
-        except Exception as exc:
-            console_log(f"Extraction failed: {exc}", category="UI-EXTRACT", level="ERROR")
-            QMessageBox.critical(self, "Extraction failed", str(exc))
-            self.statusBar().showMessage("Extraction failed")
-            return
-        self.csv_folder_edit.setText(chrom_dir)
-        self.plot_folder_edit.setText(chrom_dir)
-        self.labplot_folder_edit.setText(chrom_dir)
-        folder_name = os.path.basename(os.path.normpath(chrom_dir)) or "export"
-        self.labplot_output_edit.setText(os.path.join(chrom_dir, f"Waters_{folder_name}_export.vsz"))
-        self.refresh_plot_files()
-        self.refresh_integration_preview_files()
+        self.statusBar().showMessage(f"Starting RAW extraction (0/{len(run_items)})...")
+
+        # Configure worker & UI controls
+        self.extract_button.setEnabled(False)
+        self.run_integration_button.setEnabled(False)
+        self.status_progress.setRange(0, len(run_items))
+        self.status_progress.setValue(0)
+        self.status_progress.setVisible(True)
+        self.status_abort_btn.setEnabled(True)
+        self.status_abort_btn.setText("Abort")
+        self.status_abort_btn.setVisible(True)
+
+        self.active_cancellation_token = CancellationToken()
+        worker = ExtractionWorker(
+            root=root,
+            prec=0,
+            merge_wavelengths=merge_wavelengths,
+            group_rules=rules,
+            match_mode=self.current_match_mode(),
+            run_items=run_items,
+            token=self.active_cancellation_token,
+        )
+        worker.signals.progress.connect(self._on_extract_progress)
+        worker.signals.finished.connect(self._on_extract_finished)
+        worker.signals.cancelled.connect(self._on_extract_cancelled)
+        worker.signals.error.connect(self._on_extract_error)
+        self.thread_pool.start(worker)
+
+    def _on_extract_progress(self, current: int, total: int, sample_name: str):
+        self.status_progress.setMaximum(total)
+        self.status_progress.setValue(current)
+        self.statusBar().showMessage(f"Extracting ({current}/{total}): {sample_name}")
+
+    def _on_extract_finished(self, result: dict):
+        self._reset_task_ui()
+        chrom_dir = result.get("chrom_dir", "")
+        if chrom_dir:
+            self.csv_folder_edit.setText(chrom_dir)
+            self.plot_folder_edit.setText(chrom_dir)
+            self.labplot_folder_edit.setText(chrom_dir)
+            folder_name = os.path.basename(os.path.normpath(chrom_dir)) or "export"
+            self.labplot_output_edit.setText(os.path.join(chrom_dir, f"Waters_{folder_name}_export.vsz"))
+            self.refresh_plot_files()
+            self.refresh_integration_preview_files()
         self.refresh_raw_preview()
         console_log(f"Extraction finished successfully -> {chrom_dir}", category="UI-EXTRACT")
         QMessageBox.information(
             self,
             "Extraction complete",
-            f"Chromatographic CSV files were written to:\n{chrom_dir}\n\n" +
-            f"m/z and TIC CSVs are in sibling folders:\n" +
+            f"Chromatographic CSV files were written to:\n{chrom_dir}\n\n"
+            f"m/z and TIC CSVs are in sibling folders:\n"
             f"{os.path.dirname(chrom_dir)}"
         )
         self.statusBar().showMessage(f"Extraction complete: {chrom_dir}")
+
+    def _on_extract_cancelled(self):
+        self._reset_task_ui()
+        self.refresh_raw_preview()
+        console_log("Extraction aborted by user.", category="UI-EXTRACT", level="WARN")
+        self.statusBar().showMessage("Extraction aborted")
+        QMessageBox.warning(self, "Extraction Aborted", "The extraction operation was stopped by the user.")
+
+    def _on_extract_error(self, err_msg: str):
+        self._reset_task_ui()
+        self.refresh_raw_preview()
+        console_log(f"Extraction failed: {err_msg}", category="UI-EXTRACT", level="ERROR")
+        QMessageBox.critical(self, "Extraction failed", err_msg)
+        self.statusBar().showMessage("Extraction failed")
 
     def browse_csv_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select chromatogram CSV folder")
@@ -2801,45 +3107,76 @@ class MassLynxWindow(QMainWindow):
 
         target_summary = ", ".join(f"{c:.3f}m (-{tm:.3f},+{tp:.3f})" for c, tm, tp in self.targets)
         console_log(f"Starting peak integration in: {csv_folder} ({len(files)} CSVs, targets: [{target_summary}])", category="UI-INTEGRATE")
+        self.statusBar().showMessage(f"Starting peak integration (0/{len(files)})...")
 
-        headers = ["Sample"] + [f"{center:.3f} min" for center, _, _ in self.targets]
-        rows = []
-        processed = 0
-        for sample_name, path in files:
-            try:
-                channels = read_chrom_csv_channels(path)
-                if not channels:
-                    raise ValueError("Empty or invalid chromatogram")
-                for channel_name, times, intensities in channels:
-                    areas = [
-                        integrate_peak_asym(times, intensities, center, tol_minus, tol_plus, smooth_win=5)
-                        for center, tol_minus, tol_plus in self.targets
-                    ]
-                    name = sample_name
-                    if len(channels) > 1:
-                        name = f"{sample_name}_{channel_name.replace(' ', '')}"
-                    area_strs = [f"{area:.6g}" for area in areas]
-                    rows.append({"Sample": name, **{header: val for header, val in zip(headers[1:], area_strs)}})
-                    area_log = ", ".join(f"{c:.3f}m={a:.4g}" for (c, _, _), a in zip(self.targets, areas))
-                    console_log(f"Integrated '{name}': {area_log}", category="UI-INTEGRATE")
-                processed += 1
-            except Exception as exc:
-                console_log(f"Integration error for '{sample_name}': {exc}", category="UI-INTEGRATE", level="WARN")
-                rows.append({"Sample": sample_name, **{header: "0" for header in headers[1:]}})
+        # Configure worker & UI controls
+        self.extract_button.setEnabled(False)
+        self.run_integration_button.setEnabled(False)
+        self.status_progress.setRange(0, len(files))
+        self.status_progress.setValue(0)
+        self.status_progress.setVisible(True)
+        self.status_abort_btn.setEnabled(True)
+        self.status_abort_btn.setText("Abort")
+        self.status_abort_btn.setVisible(True)
 
-        output_path = os.path.join(csv_folder, "00_evaluated_data.csv")
-        try:
-            with open(output_path, "w", newline="", encoding="utf-8") as output_file:
-                writer = csv.DictWriter(output_file, fieldnames=headers)
-                writer.writeheader()
-                writer.writerows(rows)
-            console_log(f"Saved evaluation summary to: {output_path} ({len(rows)} sample/channel rows, {len(self.targets)} targets)", category="UI-INTEGRATE")
-        except OSError as exc:
-            console_log(f"Write failed for {output_path}: {exc}", category="UI-INTEGRATE", level="ERROR")
-            QMessageBox.critical(self, "Write failed", str(exc))
-            return
+        self.active_cancellation_token = CancellationToken()
+        worker = IntegrationWorker(
+            csv_folder=csv_folder,
+            files=files,
+            targets=list(self.targets),
+            token=self.active_cancellation_token,
+        )
+        worker.signals.progress.connect(self._on_integrate_progress)
+        worker.signals.finished.connect(self._on_integrate_finished)
+        worker.signals.cancelled.connect(self._on_integrate_cancelled)
+        worker.signals.error.connect(self._on_integrate_error)
+        self.thread_pool.start(worker)
+
+    def _on_integrate_progress(self, current: int, total: int, sample_name: str):
+        self.status_progress.setMaximum(total)
+        self.status_progress.setValue(current)
+        self.statusBar().showMessage(f"Integrating ({current}/{total}): {sample_name}")
+
+    def _on_integrate_finished(self, result: dict):
+        self._reset_task_ui()
+        output_path = result.get("output_path", "")
+        processed = result.get("processed", 0)
+        total = result.get("total", 0)
+        self.refresh_plot_files()
+        self.statusBar().showMessage(f"Integration complete: {processed}/{total} files")
         QMessageBox.information(self, "Integration complete", f"Integrated {processed} file(s).\nSaved to:\n{output_path}")
-        self.statusBar().showMessage(f"Integration complete: {processed}/{len(files)} files")
+
+    def _on_integrate_cancelled(self):
+        self._reset_task_ui()
+        console_log("Peak integration aborted by user.", category="UI-INTEGRATE", level="WARN")
+        self.statusBar().showMessage("Integration aborted")
+        QMessageBox.warning(self, "Integration Aborted", "Peak integration was stopped by the user.")
+
+    def _on_integrate_error(self, err_msg: str):
+        self._reset_task_ui()
+        console_log(f"Integration failed: {err_msg}", category="UI-INTEGRATE", level="ERROR")
+        QMessageBox.critical(self, "Integration failed", err_msg)
+        self.statusBar().showMessage("Integration failed")
+
+    def abort_active_task(self):
+        if self.active_cancellation_token and not self.active_cancellation_token.is_cancelled():
+            self.status_abort_btn.setEnabled(False)
+            self.status_abort_btn.setText("Stopping...")
+            self.statusBar().showMessage("Aborting active operation...")
+            console_log("Cancellation requested by user.", category="SYSTEM", level="WARN")
+            self.active_cancellation_token.cancel()
+
+    def _reset_task_ui(self):
+        self.active_cancellation_token = None
+        self.status_progress.setVisible(False)
+        self.status_progress.setValue(0)
+        self.status_abort_btn.setVisible(False)
+        self.status_abort_btn.setEnabled(True)
+        self.status_abort_btn.setText("Abort")
+        if hasattr(self, "extract_button"):
+            self.extract_button.setEnabled(True)
+        if hasattr(self, "run_integration_button"):
+            self.run_integration_button.setEnabled(True)
 
     def browse_plot_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder with chromatogram CSVs")
@@ -2880,8 +3217,10 @@ class MassLynxWindow(QMainWindow):
     def load_plot_csv(self, *_args):
         selected_rows = self.plot_file_table.selectionModel().selectedRows()
         path = None
+        row_idx = -1
         if selected_rows:
-            item = self.plot_file_table.item(selected_rows[0].row(), 0)
+            row_idx = selected_rows[0].row()
+            item = self.plot_file_table.item(row_idx, 0)
             path = item.data(Qt.ItemDataRole.UserRole) if item else None
         if not path:
             self.plot_dataframe = None
@@ -2892,21 +3231,28 @@ class MassLynxWindow(QMainWindow):
             self.csv_preview_status.setText("Select a CSV file to inspect its rows.")
             self.update_plot()
             return
-        try:
-            frame = pd.read_csv(path)
-        except Exception as exc:
-            console_log(f"Failed reading plot CSV '{path}': {exc}", category="UI-PLOT", level="WARN")
-            self.plot_dataframe = None
-            self.plot_csv_type = "CSV"
-            self.csv_preview_table.clear()
-            self.csv_preview_table.setRowCount(0)
-            self.csv_preview_table.setColumnCount(0)
-            self.csv_preview_status.setText("No table preview available for this file.")
-            self.plot_status_label.setText(f"Could not read CSV: {exc}")
-            self.update_plot()
+
+        self._csv_load_request_id += 1
+        req_id = self._csv_load_request_id
+        file_name = os.path.basename(path)
+        self.plot_status_label.setText(f"Loading '{file_name}'...")
+        self.csv_preview_status.setText(f"Loading '{file_name}' asynchronously...")
+
+        worker = CsvLoaderWorker(path=path, request_id=req_id, row_index=row_idx)
+        worker.signals.finished.connect(self._on_plot_csv_loaded)
+        worker.signals.error.connect(self._on_plot_csv_error)
+        self.thread_pool.start(worker)
+
+    def _on_plot_csv_loaded(self, data: dict):
+        if data.get("request_id") != self._csv_load_request_id:
+            # Discard stale CSV load response from previously selected row
             return
+        frame = data["frame"]
+        path = data["path"]
+        row_idx = data["row_index"]
+
         self.plot_dataframe = frame
-        type_item = self.plot_file_table.item(selected_rows[0].row(), 1)
+        type_item = self.plot_file_table.item(row_idx, 1)
         self.plot_csv_type = classify_csv_type(path, frame.columns)
         if type_item is not None:
             type_item.setText(self.plot_csv_type)
@@ -2948,6 +3294,31 @@ class MassLynxWindow(QMainWindow):
             category="UI-PLOT",
         )
         self.populate_csv_preview(frame)
+        self.update_plot()
+
+    def _on_plot_csv_error(self, err_payload: str):
+        parts = err_payload.split(":::path:::")
+        err_msg = parts[0]
+        path = ""
+        req_id = None
+        if len(parts) > 1:
+            subparts = parts[1].split(":::req:::")
+            path = subparts[0]
+            if len(subparts) > 1:
+                try:
+                    req_id = int(subparts[1])
+                except ValueError:
+                    pass
+        if req_id is not None and req_id != self._csv_load_request_id:
+            return
+        console_log(f"Failed reading plot CSV '{path}': {err_msg}", category="UI-PLOT", level="WARN")
+        self.plot_dataframe = None
+        self.plot_csv_type = "CSV"
+        self.csv_preview_table.clear()
+        self.csv_preview_table.setRowCount(0)
+        self.csv_preview_table.setColumnCount(0)
+        self.csv_preview_status.setText("No table preview available for this file.")
+        self.plot_status_label.setText(f"Could not read CSV: {err_msg}")
         self.update_plot()
 
     def populate_csv_preview(self, frame: pd.DataFrame):
@@ -3183,11 +3554,13 @@ class MassLynxWindow(QMainWindow):
         console_log(f"Plot exported successfully: {filename}", category="UI-EXPORT")
 
 
-# ---------------------------
-# Run
-# ---------------------------
+# =============================================================================
+# PART 8: APPLICATION ENTRY POINT & CLI BOOTSTRAP
+# =============================================================================
+
 if __name__ == "__main__":
     qt_app = QApplication(sys.argv)
     window = MassLynxWindow()
     window.show()
     sys.exit(qt_app.exec())
+
