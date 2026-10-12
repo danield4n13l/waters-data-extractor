@@ -211,6 +211,7 @@ waters-data-extractor/
 ├── Waters_Integrator_exporter.py  # Standalone Veusz / LabPlot document exporter & CLI
 ├── requirements.txt               # Python dependencies (pandas, matplotlib, PySide6, rainbow-api)
 ├── pyproject.toml                 # Project metadata and packaging config
+├── TODO.md                        # Development roadmap & future TODO plan
 ├── .gitignore                     # Git ignore file for Python and raw lab data
 ├── .gitattributes                 # Git line-ending and binary tracking
 ├── LICENSE                        # MIT License
