@@ -19,7 +19,17 @@ import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from PySide6.QtCore import QObject, QSettings, Qt, Signal, QTime, QUrl, QSize
-from PySide6.QtGui import QColor, QPalette, QDesktopServices, QTextCursor, QPainter, QPen
+from PySide6.QtGui import (
+    QColor,
+    QPalette,
+    QDesktopServices,
+    QTextCursor,
+    QPainter,
+    QPen,
+    QSyntaxHighlighter,
+    QTextCharFormat,
+    QFont,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -130,6 +140,91 @@ def get_settings_json_path() -> str:
         config_dir = os.path.join(os.path.expanduser("~"), ".config", "danield4n13l", "MassLynxIntegrator")
     os.makedirs(config_dir, exist_ok=True)
     return os.path.join(config_dir, "templates_settings.json")
+
+
+# ---------------------------
+# Console syntax highlighting
+# ---------------------------
+
+class ConsoleLogHighlighter(QSyntaxHighlighter):
+    """
+    Fast syntax highlighter for the runtime console drawer.
+    Provides colorful formatting for timestamps, log levels, categories,
+    file paths, quoted strings, quantities, and exceptions.
+    """
+
+    def __init__(self, document, is_dark: bool = True):
+        super().__init__(document)
+        self.is_dark = is_dark
+        self._init_rules()
+
+    def set_dark_mode(self, is_dark: bool):
+        if self.is_dark != is_dark:
+            self.is_dark = is_dark
+            self._init_rules()
+            self.rehighlight()
+
+    def _init_rules(self):
+        self.rules = []
+
+        # 1. Timestamps: [HH:MM:SS.mmm]
+        fmt_ts = QTextCharFormat()
+        fmt_ts.setForeground(QColor("#8b949e" if self.is_dark else "#6e7781"))
+        self.rules.append((re.compile(r"\[\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?\]"), fmt_ts))
+
+        # 2. Log Levels: [INFO ], [WARN ], [ERROR], [DEBUG], [STATUS], etc.
+        level_specs = [
+            (r"\[INFO\s*\]", "#58a6ff" if self.is_dark else "#0969da", True),
+            (r"\[WARN(?:ING)?\s*\]", "#f0883e" if self.is_dark else "#b06200", True),
+            (r"\[ERROR\s*\]|\[CRITICAL\s*\]", "#f85149" if self.is_dark else "#cf222e", True),
+            (r"\[DEBUG\s*\]", "#d2a8ff" if self.is_dark else "#8250df", False),
+            (r"\[STATUS\s*\]|\[SYSTEM\s*\]", "#39c5bb" if self.is_dark else "#0d9488", True),
+        ]
+        for pattern, color, bold in level_specs:
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(color))
+            if bold:
+                fmt.setFontWeight(QFont.Weight.Bold)
+            self.rules.append((re.compile(pattern), fmt))
+
+        # 3. Category tags: [EXTRACT], [RAW-DAD], [INIT], [TARGETS], etc.
+        fmt_cat = QTextCharFormat()
+        fmt_cat.setForeground(QColor("#38bdf8" if self.is_dark else "#0284c7"))
+        fmt_cat.setFontWeight(QFont.Weight.DemiBold)
+        self.rules.append((re.compile(r"\[[A-Z0-9\-_]{2,}\]"), fmt_cat))
+
+        # 4. Quoted strings / values
+        fmt_str = QTextCharFormat()
+        fmt_str.setForeground(QColor("#a5d6ff" if self.is_dark else "#0550ae"))
+        self.rules.append((re.compile(r"'[^']*'|\"[^\"]*\""), fmt_str))
+
+        # 5. File extensions / paths (*.raw, *.csv, *.lml, *.vsz, *.dat, *.json, *.py)
+        fmt_ext = QTextCharFormat()
+        fmt_ext.setForeground(QColor("#7ee787" if self.is_dark else "#116329"))
+        self.rules.append((re.compile(r"\b[\w\-./\\]+\.(?:raw|csv|lml|vsz|dat|json|py)\b", re.IGNORECASE), fmt_ext))
+
+        # 6. Quantities & metrics: "12 samples", "254 nm", "1.500 min", "5 succeeded", etc.
+        fmt_metric = QTextCharFormat()
+        fmt_metric.setForeground(QColor("#e3b341" if self.is_dark else "#9a6700"))
+        self.rules.append((re.compile(r"\b\d+(?:\.\d+)?\s*(?:min|nm|rows|samples|succeeded|failed|lines|runs|CSVs|dpi)\b", re.IGNORECASE), fmt_metric))
+
+        # 7. Directional arrows: -> or =>
+        fmt_arr = QTextCharFormat()
+        fmt_arr.setForeground(QColor("#ff7b72" if self.is_dark else "#bf3989"))
+        fmt_arr.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"->|=>"), fmt_arr))
+
+        # 8. Python Exceptions & Tracebacks
+        fmt_exc = QTextCharFormat()
+        fmt_exc.setForeground(QColor("#ff7b72" if self.is_dark else "#cf222e"))
+        fmt_exc.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"^(?:\s*Traceback \(most recent call last\):|[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception):.*)", re.MULTILINE), fmt_exc))
+
+    def highlightBlock(self, text: str):
+        for pattern, fmt in self.rules:
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                self.setFormat(start, end - start, fmt)
 
 
 def sanitize_filename(name: str, default: str = "sample") -> str:
@@ -1193,6 +1288,9 @@ class MassLynxWindow(QMainWindow):
         self.settings.setValue("theme/style", theme)
         self.settings.setValue("theme/mode", mode)
 
+        if hasattr(self, "console_highlighter"):
+            self.console_highlighter.set_dark_mode(system_dark)
+
         if hasattr(self, "console_text"):
             console_bg = "#161719" if system_dark else "#fdfdfd"
             console_border = "#35393f" if system_dark else "#d4d9df"
@@ -2183,6 +2281,14 @@ class MassLynxWindow(QMainWindow):
         self.console_text.setReadOnly(True)
         self.console_text.setMaximumBlockCount(5000)
         self.console_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+        mono_font = QFont("Consolas", 10)
+        mono_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.console_text.setFont(mono_font)
+
+        is_dark = (self.settings.value("theme/mode", "Dark") != "Light")
+        self.console_highlighter = ConsoleLogHighlighter(self.console_text.document(), is_dark=is_dark)
+
         console_layout.addWidget(self.console_text, 1)
 
         console_container.setMinimumHeight(150)
