@@ -142,6 +142,86 @@ def get_settings_json_path() -> str:
     return os.path.join(config_dir, "templates_settings.json")
 
 
+def get_processed_history_json_path() -> str:
+    """Return the absolute path to the processed/exported raw runs JSON database."""
+    app_data = os.environ.get("APPDATA")
+    if app_data:
+        config_dir = os.path.join(app_data, "danield4n13l", "MassLynxIntegrator")
+    else:
+        config_dir = os.path.join(os.path.expanduser("~"), ".config", "danield4n13l", "MassLynxIntegrator")
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, "processed_raw_history.json")
+
+
+def load_processed_history() -> dict:
+    """Load the persistent database of processed/exported raw runs."""
+    path = get_processed_history_json_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as exc:
+            console_log(f"Failed to read processed raw history: {exc}", category="HISTORY", level="WARN")
+    return {"processed_runs": {}}
+
+
+def save_processed_history(history: dict) -> bool:
+    """Save the persistent database of processed/exported raw runs."""
+    path = get_processed_history_json_path()
+    try:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+        return True
+    except Exception as exc:
+        console_log(f"Failed to write processed raw history: {exc}", category="HISTORY", level="WARN")
+        return False
+
+
+def _normalize_raw_path(raw_path: str) -> str:
+    """Normalize a raw path for cross-platform case-insensitive comparison."""
+    return os.path.normcase(os.path.abspath(raw_path))
+
+
+def is_raw_run_processed(raw_dir: str, history: Optional[dict] = None) -> bool:
+    """Check if a given .raw folder or filename is recorded in the exported history."""
+    if history is None:
+        history = load_processed_history()
+    runs = history.get("processed_runs", {})
+    norm_path = _normalize_raw_path(raw_dir)
+    if norm_path in runs:
+        return True
+    base_name = os.path.basename(raw_dir).lower()
+    for k, v in runs.items():
+        if v.get("name", "").lower() == base_name or os.path.basename(k).lower() == base_name:
+            return True
+    return False
+
+
+def record_processed_runs(run_items: List[tuple]):
+    """
+    Record a list of (raw_dir, destination) tuples into the processed history JSON database.
+    """
+    if not run_items:
+        return
+    history = load_processed_history()
+    runs = history.setdefault("processed_runs", {})
+    now_iso = datetime.datetime.now().isoformat()
+    for raw_dir, dest in run_items:
+        norm_key = _normalize_raw_path(raw_dir)
+        runs[norm_key] = {
+            "path": os.path.abspath(raw_dir),
+            "name": os.path.basename(raw_dir),
+            "destination": dest or "",
+            "exported_at": now_iso,
+        }
+    save_processed_history(history)
+    console_log(f"Recorded {len(run_items)} raw run(s) in processed history database", category="HISTORY")
+
+
 # ---------------------------
 # Console syntax highlighting
 # ---------------------------
@@ -479,6 +559,7 @@ def extract_masslynx_folder(
     merge_wavelengths: Optional[List[str]] = None,
     group_rules: Optional[List[tuple]] = None,
     match_mode: str = "Regex",
+    run_items: Optional[List[tuple]] = None,
 ) -> str:
     """
     Extract MassLynx .raw folders beneath 'root' into:
@@ -486,6 +567,7 @@ def extract_masslynx_folder(
         <root>/csvs/mz     (*_mz.csv)
         <root>/csvs/tic    (*_tic.csv)
 
+    If run_items is provided, only extracts the specified [(raw_dir, dest_override), ...] entries.
     Returns the path to the chromatographic folder (chrom_dir).
     """
     root = os.path.abspath(root)
@@ -498,45 +580,58 @@ def extract_masslynx_folder(
     os.makedirs(mz_dir, exist_ok=True)
     os.makedirs(tic_dir, exist_ok=True)
 
-    console_log(f"Scanning for MassLynx .raw directories under: {root}", category="EXTRACT")
-    raw_dirs = iter_raw_dirs(root)
-    console_log(f"Discovered {len(raw_dirs)} .raw directory run(s) containing .DAT data", category="EXTRACT")
+    if run_items is not None:
+        target_runs = run_items
+        console_log(f"Extracting {len(target_runs)} selected .raw run(s) beneath: {root}", category="EXTRACT")
+    else:
+        console_log(f"Scanning for MassLynx .raw directories under: {root}", category="EXTRACT")
+        raw_dirs = sorted(iter_raw_dirs(root))
+        target_runs = [(r, None) for r in raw_dirs]
+        console_log(f"Discovered {len(target_runs)} .raw directory run(s) containing .DAT data", category="EXTRACT")
+
     if group_rules:
         console_log(f"Configured {len(group_rules)} folder group rule(s) [Mode: {match_mode}]", category="EXTRACT")
     if merge_wavelengths:
         console_log(f"Merge wavelengths requested: {', '.join(merge_wavelengths)} nm", category="EXTRACT")
 
     if status_cb:
-        status_cb(f"Found {len(raw_dirs)} .raw folder(s).")
+        status_cb(f"Extracting {len(target_runs)} .raw folder(s)...")
 
     processed = 0
     failed = 0
+    successfully_processed = []
 
-    for idx, raw_dir in enumerate(sorted(raw_dirs)):
+    for idx, (raw_dir, dest_override) in enumerate(target_runs):
         base_raw = os.path.basename(raw_dir)
         base_name = base_raw[:-4] if base_raw.lower().endswith(".raw") else base_raw
         base_name = sanitize_filename(base_name, default="sample")
 
         if status_cb:
-            status_cb(f"[{idx+1}/{len(raw_dirs)}] {base_raw}")
+            status_cb(f"[{idx+1}/{len(target_runs)}] {base_raw}")
 
         func001 = None
         func002 = None
-        for fn in os.listdir(raw_dir):
-            up = fn.upper()
-            if up.endswith(".DAT"):
-                if "_FUNC001" in up and func001 is None:
-                    func001 = os.path.join(raw_dir, fn)
-                elif "_FUNC002" in up and func002 is None:
-                    func002 = os.path.join(raw_dir, fn)
+        if os.path.isdir(raw_dir):
+            for fn in os.listdir(raw_dir):
+                up = fn.upper()
+                if up.endswith(".DAT"):
+                    if "_FUNC001" in up and func001 is None:
+                        func001 = os.path.join(raw_dir, fn)
+                    elif "_FUNC002" in up and func002 is None:
+                        func002 = os.path.join(raw_dir, fn)
 
         try:
-            group = match_group(base_raw, group_rules or [], match_mode)
+            if dest_override is not None:
+                group = sanitize_folder_path(dest_override) if dest_override else ""
+            else:
+                group = match_group(base_raw, group_rules or [], match_mode)
             sample_mz_dir = os.path.join(mz_dir, group) if group else mz_dir
             sample_tic_dir = os.path.join(tic_dir, group) if group else tic_dir
             sample_chrom_dir = os.path.join(chrom_dir, group) if group else chrom_dir
+            dest_tag = f"override '{group or '(root)'}'" if dest_override is not None else f"rule '{group or '(root)'}'"
             console_log(
-                f"[{idx+1}/{len(raw_dirs)}] Processing '{base_raw}' -> group '{group or '(root)'}' (MS _FUNC001: {'found' if func001 else 'none'}, DAD _FUNC002: {'found' if func002 else 'none'})",
+                f"[{idx+1}/{len(target_runs)}] Processing '{base_raw}' -> group {dest_tag} "
+                f"(MS _FUNC001: {'found' if func001 else 'none'}, DAD _FUNC002: {'found' if func002 else 'none'})",
                 category="EXTRACT",
             )
             if func001:
@@ -550,9 +645,13 @@ def extract_masslynx_folder(
                     merge_wavelengths=merge_wavelengths,
                 )
             processed += 1
+            successfully_processed.append((raw_dir, group))
         except Exception as exc:
             failed += 1
             console_log(f"Failed extracting run '{base_raw}': {exc}", category="EXTRACT", level="ERROR")
+
+    if successfully_processed:
+        record_processed_runs(successfully_processed)
 
     msg = f"Done: processed {processed}, failed {failed}."
     if status_cb:
@@ -1425,17 +1524,37 @@ class MassLynxWindow(QMainWindow):
         preview_button = QPushButton("Preview samples")
         preview_button.setObjectName("secondaryButton")
         preview_button.clicked.connect(self.refresh_raw_preview)
+
+        self.raw_enable_all_btn = QPushButton("Re-enable all")
+        self.raw_enable_all_btn.setObjectName("secondaryButton")
+        self.raw_enable_all_btn.setToolTip("Re-enable all samples for import (including previously exported ones)")
+        self.raw_enable_all_btn.clicked.connect(self.enable_all_raw_rows)
+
         self.raw_preview_summary = QLabel("Select a root folder to preview samples.")
         preview_toolbar.addWidget(preview_button)
+        preview_toolbar.addWidget(self.raw_enable_all_btn)
         preview_toolbar.addWidget(self.raw_preview_summary, 1)
         section.body_layout.addLayout(preview_toolbar)
 
-        self.raw_preview_table = QTableWidget(0, 2)
-        self.raw_preview_table.setHorizontalHeaderLabels(["RAW sample", "Destination"])
-        self.raw_preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.raw_preview_table = QTableWidget(0, 4)
+        self.raw_preview_table.setHorizontalHeaderLabels(["Import", "RAW sample", "Manual", "Destination"])
+        self.raw_preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.raw_preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.raw_preview_table.setMaximumHeight(175)
+        self.raw_preview_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.raw_preview_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.raw_preview_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.raw_preview_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.raw_preview_table.itemChanged.connect(self._on_raw_table_item_changed)
+        self.raw_preview_table.setMaximumHeight(200)
         section.body_layout.addWidget(self.raw_preview_table)
+
+        self.group_rules_edit.textChanged.connect(self._update_auto_destinations)
+        self.wildcard_radio.toggled.connect(self._update_auto_destinations)
+        self.regex_radio.toggled.connect(self._update_auto_destinations)
 
         extract_button = QPushButton("Extract files")
         extract_button.clicked.connect(self.extract_clicked)
@@ -2373,20 +2492,153 @@ class MassLynxWindow(QMainWindow):
         console_log(f"Refreshing RAW preview: scanning '{root}' (mode: {self.current_match_mode()}, rules: {len(rules)})", category="UI-PREVIEW")
         raw_dirs = sorted(iter_raw_dirs(root))
         console_log(f"Discovered {len(raw_dirs)} .raw directory runs in root folder", category="UI-PREVIEW")
+
+        history = load_processed_history()
+
+        self._updating_raw_table = True
         self.raw_preview_table.setRowCount(0)
-        for raw_dir in raw_dirs[:20]:
+        mode = self.current_match_mode()
+
+        for raw_dir in raw_dirs:
             raw_name = os.path.basename(raw_dir)
             try:
-                destination = match_group(raw_name, rules, self.current_match_mode()) or "(root)"
+                destination = match_group(raw_name, rules, mode) or "(root)"
             except ValueError as exc:
+                self._updating_raw_table = False
                 console_log(f"Rule match failed for '{raw_name}': {exc}", category="UI-PREVIEW", level="WARN")
                 QMessageBox.warning(self, "Invalid folder rule", str(exc))
                 return
+
+            already_exported = is_raw_run_processed(raw_dir, history)
             row = self.raw_preview_table.rowCount()
             self.raw_preview_table.insertRow(row)
-            self.raw_preview_table.setItem(row, 0, QTableWidgetItem(raw_name))
-            self.raw_preview_table.setItem(row, 1, QTableWidgetItem(destination))
-        self.raw_preview_summary.setText(f"Found {len(raw_dirs)} samples; previewing {min(20, len(raw_dirs))}.")
+
+            # Col 0: Import checkbox (disabled by default if previously exported)
+            chk_import = QTableWidgetItem()
+            chk_import.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            chk_import.setCheckState(Qt.CheckState.Unchecked if already_exported else Qt.CheckState.Checked)
+            if already_exported:
+                chk_import.setToolTip("Previously exported - disabled by default. Check to re-export.")
+            else:
+                chk_import.setToolTip("Include sample in extraction")
+            self.raw_preview_table.setItem(row, 0, chk_import)
+
+            # Col 1: RAW sample name (read-only)
+            name_item = QTableWidgetItem(raw_name)
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            name_item.setData(Qt.ItemDataRole.UserRole, raw_dir)
+            if already_exported:
+                name_item.setToolTip(f"{raw_dir}\n(Status: Previously exported - skipped by default)")
+            else:
+                name_item.setToolTip(raw_dir)
+            self.raw_preview_table.setItem(row, 1, name_item)
+
+            # Col 2: Manual destination checkbox
+            manual_chk = QTableWidgetItem()
+            manual_chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            manual_chk.setCheckState(Qt.CheckState.Unchecked)
+            manual_chk.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            manual_chk.setToolTip("Enable manual destination editing for this row (toggles between manual and wildcard/regex grouping)")
+            self.raw_preview_table.setItem(row, 2, manual_chk)
+
+            # Col 3: Destination subfolder
+            dest_item = QTableWidgetItem(destination)
+            dest_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)  # Non-editable unless manual is checked
+            dest_item.setToolTip("Destination folder (computed via rules)")
+            self.raw_preview_table.setItem(row, 3, dest_item)
+
+        self._updating_raw_table = False
+        self._update_raw_preview_summary()
+
+    def _on_raw_table_item_changed(self, item: QTableWidgetItem):
+        if getattr(self, "_updating_raw_table", False):
+            return
+        row = item.row()
+        col = item.column()
+        if col == 2:  # Manual checkbox toggled
+            dest_item = self.raw_preview_table.item(row, 3)
+            if not dest_item:
+                return
+            is_manual = (item.checkState() == Qt.CheckState.Checked)
+            self._updating_raw_table = True
+            try:
+                if is_manual:
+                    dest_item.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled
+                        | Qt.ItemFlag.ItemIsSelectable
+                        | Qt.ItemFlag.ItemIsEditable
+                    )
+                    dest_item.setToolTip("Manual destination folder (double-click to edit)")
+                    self.raw_preview_table.editItem(dest_item)
+                else:
+                    dest_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    raw_item = self.raw_preview_table.item(row, 1)
+                    raw_name = raw_item.text() if raw_item else ""
+                    rules = self.current_group_rules() or []
+                    try:
+                        dest = match_group(raw_name, rules, self.current_match_mode()) or "(root)"
+                    except Exception:
+                        dest = "(root)"
+                    dest_item.setText(dest)
+                    dest_item.setToolTip("Destination folder (computed via rules)")
+            finally:
+                self._updating_raw_table = False
+        elif col == 0:  # Import checkbox toggled
+            self._update_raw_preview_summary()
+
+    def _update_auto_destinations(self):
+        if getattr(self, "_updating_raw_table", False):
+            return
+        if not hasattr(self, "raw_preview_table") or self.raw_preview_table.rowCount() == 0:
+            return
+        try:
+            rules = parse_group_rules(self.group_rules_edit.toPlainText(), self.current_match_mode())
+        except Exception:
+            return  # Ignore incomplete regex syntax while user is typing
+        self._updating_raw_table = True
+        try:
+            mode = self.current_match_mode()
+            for row in range(self.raw_preview_table.rowCount()):
+                manual_item = self.raw_preview_table.item(row, 2)
+                if manual_item and manual_item.checkState() == Qt.CheckState.Checked:
+                    continue  # Keep manual override
+                raw_item = self.raw_preview_table.item(row, 1)
+                dest_item = self.raw_preview_table.item(row, 3)
+                if raw_item and dest_item:
+                    try:
+                        dest = match_group(raw_item.text(), rules, mode) or "(root)"
+                        dest_item.setText(dest)
+                    except Exception:
+                        pass
+        finally:
+            self._updating_raw_table = False
+
+    def _update_raw_preview_summary(self):
+        total = self.raw_preview_table.rowCount()
+        if total == 0:
+            self.raw_preview_summary.setText("Select a root folder to preview samples.")
+            return
+        enabled = sum(
+            1 for r in range(total)
+            if self.raw_preview_table.item(r, 0) and self.raw_preview_table.item(r, 0).checkState() == Qt.CheckState.Checked
+        )
+        disabled = total - enabled
+        if disabled > 0:
+            self.raw_preview_summary.setText(f"Found {total} samples: {enabled} selected for import, {disabled} disabled.")
+        else:
+            self.raw_preview_summary.setText(f"Found {total} samples: all {total} selected for import.")
+
+    def enable_all_raw_rows(self):
+        self._updating_raw_table = True
+        try:
+            for row in range(self.raw_preview_table.rowCount()):
+                item = self.raw_preview_table.item(row, 0)
+                if item:
+                    item.setCheckState(Qt.CheckState.Checked)
+        finally:
+            self._updating_raw_table = False
+        self._update_raw_preview_summary()
+        console_log("Re-enabled all RAW samples for import", category="UI-PREVIEW")
 
     def current_match_mode(self):
         return "Regex" if self.regex_radio.isChecked() else "Wildcard"
@@ -2411,9 +2663,41 @@ class MassLynxWindow(QMainWindow):
         rules = self.current_group_rules()
         if rules is None:
             return
+
+        # Ensure preview table has the runs loaded
+        if self.raw_preview_table.rowCount() == 0:
+            self.refresh_raw_preview()
+
+        # Collect checked runs and manual overrides
+        run_items = []
+        for row in range(self.raw_preview_table.rowCount()):
+            chk_import = self.raw_preview_table.item(row, 0)
+            if not chk_import or chk_import.checkState() != Qt.CheckState.Checked:
+                continue
+            raw_item = self.raw_preview_table.item(row, 1)
+            if not raw_item:
+                continue
+            raw_dir = raw_item.data(Qt.ItemDataRole.UserRole) or os.path.join(root, raw_item.text())
+            manual_item = self.raw_preview_table.item(row, 2)
+            is_manual = bool(manual_item and manual_item.checkState() == Qt.CheckState.Checked)
+            dest_item = self.raw_preview_table.item(row, 3)
+            manual_dest = None
+            if is_manual and dest_item:
+                dest_txt = dest_item.text().strip()
+                manual_dest = "" if dest_txt == "(root)" else dest_txt
+            run_items.append((raw_dir, manual_dest))
+
+        if not run_items:
+            QMessageBox.information(
+                self,
+                "No samples selected",
+                "No RAW samples are selected for import.\nCheck the 'Import' checkbox for at least one sample or click 'Re-enable all'.",
+            )
+            return
+
         console_log(
-            f"User initiated RAW extraction on '{root}' | Match mode: {self.current_match_mode()} | "
-            f"Rules: {len(rules)} | Merge wavelengths: {merge_wavelengths or 'none'}",
+            f"User initiated RAW extraction on '{root}' | Selected runs: {len(run_items)}/{self.raw_preview_table.rowCount()} | "
+            f"Match mode: {self.current_match_mode()} | Rules: {len(rules)} | Merge wavelengths: {merge_wavelengths or 'none'}",
             category="UI-EXTRACT",
         )
         self.statusBar().showMessage("Extracting RAW files...")
@@ -2426,6 +2710,7 @@ class MassLynxWindow(QMainWindow):
                 merge_wavelengths=merge_wavelengths,
                 group_rules=rules,
                 match_mode=self.current_match_mode(),
+                run_items=run_items,
             )
         except Exception as exc:
             console_log(f"Extraction failed: {exc}", category="UI-EXTRACT", level="ERROR")
@@ -2438,6 +2723,7 @@ class MassLynxWindow(QMainWindow):
         self.labplot_output_edit.setText(os.path.join(chrom_dir, "Waters_LabPlot_Project.lml"))
         self.refresh_plot_files()
         self.refresh_integration_preview_files()
+        self.refresh_raw_preview()
         console_log(f"Extraction finished successfully -> {chrom_dir}", category="UI-EXTRACT")
         QMessageBox.information(
             self,
