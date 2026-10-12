@@ -89,7 +89,7 @@ When you extract a folder containing MassLynx runs, the application creates a st
 ### 2. Clone Repository
 
 ```bash
-git clone https://github.com/<your-username>/waters-data-extractor.git
+git clone https://github.com/danield4n13l/waters-data-extractor.git
 cd waters-data-extractor
 ```
 
@@ -121,9 +121,18 @@ pip install -r requirements.txt
 
 Launch the primary graphical interface:
 
-```bash
-python Waters_Integrator_plot.py
-```
+- **On Windows:**
+
+  Simply double-click the script to run the application.
+  
+  > [!NOTE]
+  > Occasionally, you might have to Open with... > Python.
+
+- **Alternatively, using the command line:**
+
+  ```bash
+  python Waters_Integrator_plot.py
+  ```
 
 #### Workflow Steps
 
