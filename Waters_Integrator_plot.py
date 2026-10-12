@@ -19,6 +19,17 @@ from typing import List, Optional, Tuple, Dict, Any, Callable
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+import numpy as np
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font as XlsxFont, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.chart import BarChart, Reference
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
 from PySide6.QtCore import (
     QObject,
     QSettings,
@@ -29,6 +40,7 @@ from PySide6.QtCore import (
     QSize,
     QRunnable,
     QThreadPool,
+    QTimer,
 )
 from PySide6.QtGui import (
     QColor,
@@ -317,6 +329,87 @@ class ConsoleLogHighlighter(QSyntaxHighlighter):
             for match in pattern.finditer(text):
                 start, end = match.span()
                 self.setFormat(start, end - start, fmt)
+
+
+class RegexSyntaxHighlighter(QSyntaxHighlighter):
+    """
+    Syntax highlighter for regular expression and wildcard group mapping rules.
+    Provides colorful distinctions for capture groups, character classes,
+    quantifiers, anchors, mapping arrows (=>), and replacement targets.
+    """
+
+    def __init__(self, document, is_dark: bool = True):
+        super().__init__(document)
+        self.is_dark = is_dark
+        self._init_rules()
+
+    def set_dark_mode(self, is_dark: bool):
+        if self.is_dark != is_dark:
+            self.is_dark = is_dark
+            self._init_rules()
+            self.rehighlight()
+
+    def _init_rules(self):
+        self.rules = []
+
+        # 1. Named capture groups: (?P<name>...), (?P=name)
+        fmt_group = QTextCharFormat()
+        fmt_group.setForeground(QColor("#d2a8ff" if self.is_dark else "#8250df"))
+        fmt_group.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"\(\?P<[a-zA-Z_]\w*>[^)]*\)|\(\?P=[a-zA-Z_]\w*\)"), fmt_group))
+
+        # 2. Backreferences and group expansions: \g<name>, \g<1>, \1, \2
+        fmt_backref = QTextCharFormat()
+        fmt_backref.setForeground(QColor("#c084fc" if self.is_dark else "#7c3aed"))
+        fmt_backref.setFontWeight(QFont.Weight.DemiBold)
+        self.rules.append((re.compile(r"\\g<[a-zA-Z0-9_]+>|\\\d+"), fmt_backref))
+
+        # 3. Escape sequences: \d, \w, \s, \b, \D, \W, \S, \., \\
+        fmt_escape = QTextCharFormat()
+        fmt_escape.setForeground(QColor("#facc15" if self.is_dark else "#ca8a04"))
+        fmt_escape.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"\\[dwsbDWBS.^\$*+?|()[\]{}]"), fmt_escape))
+
+        # 4. Character sets / classes: [a-z], [^0-9], etc.
+        fmt_class = QTextCharFormat()
+        fmt_class.setForeground(QColor("#fb923c" if self.is_dark else "#ea580c"))
+        self.rules.append((re.compile(r"\[(?:\^)?(?:[^\]\\]|\\.)*\]"), fmt_class))
+
+        # 5. Quantifiers: *, +, ?, {m,n}, {n}
+        fmt_quant = QTextCharFormat()
+        fmt_quant.setForeground(QColor("#4ade80" if self.is_dark else "#16a34a"))
+        fmt_quant.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"[*+?]|{\d+(?:,\d*)?}"), fmt_quant))
+
+        # 6. Anchors: ^, $
+        fmt_anchor = QTextCharFormat()
+        fmt_anchor.setForeground(QColor("#f87171" if self.is_dark else "#dc2626"))
+        fmt_anchor.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"[\^$]"), fmt_anchor))
+
+        # 7. Parentheses / groups: (, )
+        fmt_paren = QTextCharFormat()
+        fmt_paren.setForeground(QColor("#38bdf8" if self.is_dark else "#0284c7"))
+        self.rules.append((re.compile(r"[()]"), fmt_paren))
+
+        # 8. Rule delimiter arrow: => or ->
+        fmt_arrow = QTextCharFormat()
+        fmt_arrow.setForeground(QColor("#fb7185" if self.is_dark else "#e11d48"))
+        fmt_arrow.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"=>|->"), fmt_arrow))
+
+        # 9. Comments: # ...
+        fmt_comment = QTextCharFormat()
+        fmt_comment.setForeground(QColor("#64748b" if self.is_dark else "#94a3b8"))
+        fmt_comment.setFontItalic(True)
+        self.rules.append((re.compile(r"#.*$"), fmt_comment))
+
+    def highlightBlock(self, text: str):
+        for pattern, fmt in self.rules:
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                self.setFormat(start, end - start, fmt)
+
 
 
 def sanitize_filename(name: str, default: str = "sample") -> str:
@@ -892,6 +985,51 @@ def classify_csv_type(path: str, headers=None) -> str:
         return "CSV"
 
 
+def decimate_trace(times, intensities, max_points: int = 10000) -> Tuple[list, list]:
+    """
+    Downsample a chromatographic trace while strictly preserving peak extrema.
+    Uses min-max envelope binning to ensure apexes and narrow peaks are not missed.
+    If len(times) <= max_points, returns (times, intensities) unchanged.
+    """
+    n = len(times)
+    if n <= max_points or max_points < 4:
+        return list(times), list(intensities)
+
+    num_bins = max_points // 2
+    bin_size = n / num_bins
+    out_times = []
+    out_intensities = []
+
+    times_arr = np.asarray(times)
+    intens_arr = np.asarray(intensities)
+
+    for b in range(num_bins):
+        start_idx = int(b * bin_size)
+        end_idx = int((b + 1) * bin_size) if b < num_bins - 1 else n
+        if start_idx >= end_idx:
+            continue
+        bin_intens = intens_arr[start_idx:end_idx]
+        min_pos = int(np.argmin(bin_intens)) + start_idx
+        max_pos = int(np.argmax(bin_intens)) + start_idx
+
+        # Preserve chronological order within the bin
+        if min_pos < max_pos:
+            out_times.append(float(times_arr[min_pos]))
+            out_intensities.append(float(intens_arr[min_pos]))
+            out_times.append(float(times_arr[max_pos]))
+            out_intensities.append(float(intens_arr[max_pos]))
+        elif min_pos > max_pos:
+            out_times.append(float(times_arr[max_pos]))
+            out_intensities.append(float(intens_arr[max_pos]))
+            out_times.append(float(times_arr[min_pos]))
+            out_intensities.append(float(intens_arr[min_pos]))
+        else:
+            out_times.append(float(times_arr[min_pos]))
+            out_intensities.append(float(intens_arr[min_pos]))
+
+    return out_times, out_intensities
+
+
 def moving_average(seq, window=5):
     n = len(seq)
     if n == 0 or window <= 1:
@@ -1040,8 +1178,184 @@ def execute_peak_integration(
 
 
 # =============================================================================
-# PART 5: EXTERNAL EXPORTER BRIDGES (VEUSZ / LABPLOT)
+# PART 5: EXTERNAL EXPORTER BRIDGES (EXCEL / VEUSZ / LABPLOT)
 # =============================================================================
+
+def export_evaluated_to_excel(
+    csv_or_df,
+    targets: List[Tuple[float, float, float]],
+    output_path: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Export evaluated chromatographic peak integration data to a formatted Excel workbook (.xlsx).
+    Creates a multi-sheet workbook:
+      Sheet 1: 'Integrated Summary' - Styled table with zebra striping and embedded bar chart.
+      Sheet 2: 'Target Parameters' - Retention times, tolerances, and integration windows.
+      Sheet 3: 'Metadata & Diagnostics' - Software version, run timestamp, and statistics.
+    Requires openpyxl.
+    """
+    if not HAS_OPENPYXL:
+        raise ImportError(
+            "The 'openpyxl' package is required for Excel export.\n"
+            "Please run 'pip install openpyxl' to enable this feature."
+        )
+
+    if isinstance(csv_or_df, str):
+        df = pd.read_csv(csv_or_df)
+    else:
+        df = csv_or_df.copy()
+
+    wb = openpyxl.Workbook()
+
+    # --- Sheet 1: Integrated Summary ---
+    ws1 = wb.active
+    ws1.title = "Integrated Summary"
+    ws1.views.sheetView[0].showGridLines = True
+
+    # Title Banner
+    ws1["A1"] = "Waters MassLynx - Peak Integration Summary"
+    ws1["A1"].font = XlsxFont(name="Calibri", size=14, bold=True, color="207567")
+
+    subtitle = f"Exported: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Total Samples: {len(df)} | Targets: {len(targets)}"
+    ws1["A2"] = subtitle
+    ws1["A2"].font = XlsxFont(name="Calibri", size=10, italic=True, color="555555")
+
+    # Table Header (Row 4)
+    header_fill = PatternFill(start_color="207567", end_color="207567", fill_type="solid")
+    header_font = XlsxFont(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    headers = list(df.columns)
+    for col_idx, header_text in enumerate(headers, start=1):
+        cell = ws1.cell(row=4, column=col_idx, value=header_text)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+
+    # Table Data (Rows 5+)
+    even_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    odd_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    thin_border = Border(
+        left=Side(style="thin", color="E2E8F0"),
+        right=Side(style="thin", color="E2E8F0"),
+        top=Side(style="thin", color="E2E8F0"),
+        bottom=Side(style="thin", color="E2E8F0"),
+    )
+
+    for row_idx, row_data in enumerate(df.itertuples(index=False), start=5):
+        fill = even_fill if (row_idx % 2 == 0) else odd_fill
+        for col_idx, val in enumerate(row_data, start=1):
+            cell = ws1.cell(row=row_idx, column=col_idx)
+            if col_idx > 1:
+                try:
+                    num_val = float(val)
+                    cell.value = num_val
+                    cell.number_format = "0.000000"
+                    cell.alignment = Alignment(horizontal="right")
+                except (ValueError, TypeError):
+                    cell.value = str(val)
+                    cell.alignment = Alignment(horizontal="left")
+            else:
+                cell.value = str(val)
+                cell.alignment = Alignment(horizontal="left")
+            cell.fill = fill
+            cell.border = thin_border
+            cell.font = XlsxFont(name="Calibri", size=10)
+
+    # Freeze panes below header
+    ws1.freeze_panes = "A5"
+
+    # Auto-adjust column widths
+    for col_idx, col_name in enumerate(headers, start=1):
+        col_letter = get_column_letter(col_idx)
+        max_len = max(len(str(col_name)), max((len(str(df.iloc[r, col_idx-1])) for r in range(min(50, len(df)))), default=0))
+        ws1.column_dimensions[col_letter].width = max(14, min(40, max_len + 4))
+
+    # Add Bar Chart if data exists
+    if len(df) > 0 and len(headers) > 1:
+        chart = BarChart()
+        chart.type = "col"
+        chart.style = 10
+        chart.title = "Integrated Peak Areas by Sample"
+        chart.y_axis.title = "Area"
+        chart.x_axis.title = "Sample"
+        chart.width = 18
+        chart.height = 11
+
+        data_ref = Reference(ws1, min_col=2, min_row=4, max_col=len(headers), max_row=4 + len(df))
+        cats_ref = Reference(ws1, min_col=1, min_row=5, max_row=4 + len(df))
+        chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
+        chart_col_letter = get_column_letter(len(headers) + 2)
+        ws1.add_chart(chart, f"{chart_col_letter}4")
+
+    # --- Sheet 2: Target Parameters ---
+    ws2 = wb.create_sheet(title="Target Parameters")
+    ws2.views.sheetView[0].showGridLines = True
+    ws2["A1"] = "Integration Target Windows"
+    ws2["A1"].font = XlsxFont(name="Calibri", size=13, bold=True, color="334155")
+
+    target_headers = ["Target #", "Center RT (min)", "Tolerance - (min)", "Tolerance + (min)", "Window Start (min)", "Window End (min)"]
+    t_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    for c_idx, h_text in enumerate(target_headers, start=1):
+        c = ws2.cell(row=3, column=c_idx, value=h_text)
+        c.fill = t_fill
+        c.font = XlsxFont(name="Calibri", size=10, bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center")
+
+    for t_idx, (center, tol_minus, tol_plus) in enumerate(targets, start=1):
+        r_num = 3 + t_idx
+        row_vals = [
+            f"Target {t_idx}",
+            center,
+            tol_minus,
+            tol_plus,
+            center - tol_minus,
+            center + tol_plus,
+        ]
+        for c_idx, val in enumerate(row_vals, start=1):
+            c = ws2.cell(row=r_num, column=c_idx, value=val)
+            c.border = thin_border
+            c.font = XlsxFont(name="Calibri", size=10)
+            if isinstance(val, (int, float)):
+                c.number_format = "0.000"
+                c.alignment = Alignment(horizontal="right")
+
+    for col in ws2.columns:
+        col_letter = get_column_letter(col[0].column)
+        ws2.column_dimensions[col_letter].width = 20
+
+    # --- Sheet 3: Metadata & Diagnostics ---
+    ws3 = wb.create_sheet(title="Metadata")
+    ws3.views.sheetView[0].showGridLines = True
+    ws3["A1"] = "Experiment & Export Metadata"
+    ws3["A1"].font = XlsxFont(name="Calibri", size=13, bold=True, color="334155")
+
+    meta_items = [
+        ("Application", "Waters MassLynx Integrator"),
+        ("Export Timestamp", datetime.datetime.now().isoformat()),
+        ("Samples Evaluated", len(df)),
+        ("Targets Configured", len(targets)),
+        ("Target Summary", ", ".join(f"{c:.3f}m (-{tm:.3f},+{tp:.3f})" for c, tm, tp in targets)),
+    ]
+    if metadata:
+        meta_items.extend(metadata.items())
+
+    for m_idx, (k, v) in enumerate(meta_items, start=3):
+        k_cell = ws3.cell(row=m_idx, column=1, value=str(k))
+        k_cell.font = XlsxFont(name="Calibri", size=10, bold=True, color="334155")
+        v_cell = ws3.cell(row=m_idx, column=2, value=str(v))
+        v_cell.font = XlsxFont(name="Calibri", size=10)
+
+    ws3.column_dimensions["A"].width = 24
+    ws3.column_dimensions["B"].width = 60
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    wb.save(output_path)
+    console_log(f"Exported evaluation workbook to Excel: {output_path} ({len(df)} rows, {len(targets)} targets)", category="UI-EXPORT")
+    return output_path
+
 
 try:
     from Waters_Integrator_exporter import (
@@ -1458,7 +1772,25 @@ class MassLynxWindow(QMainWindow):
         self.active_cancellation_token: Optional[CancellationToken] = None
         self._csv_load_request_id: int = 0
 
+        # Performance mode and canvas throttling debouncer
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(150)
+        self._resize_timer.timeout.connect(self._on_debounced_resize)
+
+        # Plot cursor guidelines and console buffer
+        self._plot_crosshair = None
+        self._integration_crosshair = None
+        self._console_history: List[Tuple[str, str]] = []
+
         self._build_ui()
+
+    def _on_debounced_resize(self):
+        """Redraw canvases after resizing finishes to prevent UI stutter."""
+        if hasattr(self, "plot_canvas"):
+            self.plot_canvas.draw_idle()
+        if hasattr(self, "integration_canvas") and hasattr(self, "integration_preview_panel") and self.integration_preview_panel.isVisible():
+            self.integration_canvas.draw_idle()
 
     def closeEvent(self, event):
         """Ensure active background workers are cancelled gracefully before closing."""
@@ -1661,6 +1993,8 @@ class MassLynxWindow(QMainWindow):
 
         if hasattr(self, "console_highlighter"):
             self.console_highlighter.set_dark_mode(system_dark)
+        if hasattr(self, "rules_highlighter"):
+            self.rules_highlighter.set_dark_mode(system_dark)
 
         if hasattr(self, "console_text"):
             console_bg = "#161719" if system_dark else "#fdfdfd"
@@ -1686,6 +2020,8 @@ class MassLynxWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "_resize_timer"):
+            self._resize_timer.start()
         narrow = self.width() < 900
         if narrow == self._responsive_narrow:
             return
@@ -1779,6 +2115,8 @@ class MassLynxWindow(QMainWindow):
         )
         self.group_rules_edit.setMaximumHeight(88)
         self.group_rules_edit.setCurrentFont(["Cascadia Code NF","Consolas", "monospace"])
+        is_dark = (self.settings.value("theme/mode", "Dark") != "Light")
+        self.rules_highlighter = RegexSyntaxHighlighter(self.group_rules_edit.document(), is_dark=is_dark)
         form.addWidget(self.group_rules_label, 2, 0, Qt.AlignmentFlag.AlignTop)
         form.addWidget(self.group_rules_edit, 2, 1, 1, 2)
 
@@ -1922,10 +2260,15 @@ class MassLynxWindow(QMainWindow):
         delete_target = QPushButton("Delete selected")
         delete_target.setObjectName("secondaryButton")
         delete_target.clicked.connect(self.delete_selected_targets)
+        self.export_excel_button = QPushButton("Export to Excel")
+        self.export_excel_button.setObjectName("secondaryButton")
+        self.export_excel_button.setToolTip("Export evaluated peak integration data to a formatted Excel workbook (.xlsx)")
+        self.export_excel_button.clicked.connect(self.export_integration_excel_clicked)
         self.run_integration_button = QPushButton("Integrate CSVs")
         self.run_integration_button.clicked.connect(self.integrate_clicked)
         target_actions.addWidget(delete_target)
         target_actions.addStretch(1)
+        target_actions.addWidget(self.export_excel_button)
         target_actions.addWidget(self.run_integration_button)
         target_row.addLayout(target_actions)
         target_layout.addLayout(target_row)
@@ -1940,17 +2283,29 @@ class MassLynxWindow(QMainWindow):
         self.integration_figure = Figure(figsize=(5, 3.5), dpi=100, constrained_layout=True)
         self.integration_axes = self.integration_figure.add_subplot(111)
         self.integration_canvas = FigureCanvasQTAgg(self.integration_figure)
+        self.integration_hud_label = QLabel("RT: -- | Signal: --")
+        self.integration_hud_label.setStyleSheet(
+            "background: palette(midlight); border-radius: 3px; padding: 2px 8px; "
+            "font-family: Consolas, monospace; font-size: 11px;"
+        )
         self.integration_toolbar = NavigationToolbar2QT(self.integration_canvas, self.integration_preview_panel)
         self.integration_toolbar.setVisible(False)
         self.integration_plot_controls.toggled.connect(self.integration_toolbar.setVisible)
+        integration_plot_layout.addWidget(self.integration_hud_label)
         integration_plot_layout.addWidget(self.integration_toolbar)
         integration_plot_layout.addWidget(self.integration_canvas, 1)
+
+        self.integration_canvas.mpl_connect("motion_notify_event", self._on_integration_canvas_hover)
+        self.integration_canvas.mpl_connect("axes_leave_event", self._on_integration_canvas_leave)
+        self.integration_canvas.mpl_connect("button_press_event", self._on_integration_canvas_click)
+
         self.integration_preview_status = QLabel("Choose a sample to preview its integration window.")
         self.integration_preview_status.setWordWrap(True)
         integration_plot_layout.addWidget(self.integration_preview_status)
         self.integration_preview_panel.setMinimumWidth(260)
         self.integration_preview_panel.setVisible(False)
         splitter.addWidget(self.integration_preview_panel)
+        splitter.splitterMoved.connect(lambda *_: self._resize_timer.start())
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
         splitter.setHandleWidth(8)
@@ -2071,7 +2426,12 @@ class MassLynxWindow(QMainWindow):
             self.integration_axes.bar(times, intensities, width=min(spacing * 0.8, 0.8), color="#207567")
             self.integration_axes.grid(True, axis="y", alpha=0.3)
         else:
-            self.integration_axes.plot(times, intensities, color="#207567", linewidth=1.5)
+            use_decimation = getattr(self, "perf_mode_checkbox", None) and self.perf_mode_checkbox.isChecked()
+            if use_decimation and len(times) > 10000:
+                times_draw, intensities_draw = decimate_trace(times, intensities, max_points=10000)
+            else:
+                times_draw, intensities_draw = times, intensities
+            self.integration_axes.plot(times_draw, intensities_draw, color="#207567", linewidth=1.5)
         for center, tol_minus, tol_plus in self.targets:
             self.integration_axes.axvspan(
                 center - tol_minus,
@@ -2313,6 +2673,11 @@ class MassLynxWindow(QMainWindow):
         controls_layout.addRow("Overlay", self.plot_all_checkbox)
         self.plot_controls_checkbox = QCheckBox("Plot controls")
         controls_layout.addRow(self.plot_controls_checkbox)
+        self.perf_mode_checkbox = QCheckBox("Performance mode")
+        self.perf_mode_checkbox.setChecked(self.settings.value("plot/perf_mode", True, type=bool))
+        self.perf_mode_checkbox.setToolTip("Downsamples preview traces exceeding 10,000 points using peak-preserving decimation for smoother interaction.")
+        self.perf_mode_checkbox.toggled.connect(self._on_perf_mode_toggled)
+        controls_layout.addRow(self.perf_mode_checkbox)
         reload_button = QPushButton("Reload CSV list")
         reload_button.setObjectName("secondaryButton")
         reload_button.clicked.connect(self.refresh_plot_files)
@@ -2320,6 +2685,11 @@ class MassLynxWindow(QMainWindow):
         export_button = QPushButton("Export plot")
         export_button.clicked.connect(self.export_plot_clicked)
         controls_layout.addRow(export_button)
+        self.plot_export_excel_btn = QPushButton("Export table to Excel")
+        self.plot_export_excel_btn.setObjectName("secondaryButton")
+        self.plot_export_excel_btn.setToolTip("Export the loaded table to a styled Excel workbook (.xlsx)")
+        self.plot_export_excel_btn.clicked.connect(self.export_plot_table_excel_clicked)
+        controls_layout.addRow(self.plot_export_excel_btn)
         self.plot_export_dpi = QSpinBox()
         self.plot_export_dpi.setRange(72, 2400)
         self.plot_export_dpi.setSingleStep(100)
@@ -2346,11 +2716,22 @@ class MassLynxWindow(QMainWindow):
         self.plot_canvas.minimumSizeHint = lambda: QSize(50, 50)
         self.plot_canvas.sizeHint = lambda: QSize(350, 200)
 
+        self.plot_hud_label = QLabel("RT: -- | Signal: --")
+        self.plot_hud_label.setStyleSheet(
+            "background: palette(midlight); border-radius: 3px; padding: 2px 8px; "
+            "font-family: Consolas, monospace; font-size: 11px;"
+        )
         self.plot_toolbar = NavigationToolbar2QT(self.plot_canvas, plot_panel)
         self.plot_toolbar.setVisible(False)
         self.plot_controls_checkbox.toggled.connect(self.plot_toolbar.setVisible)
+        plot_layout.addWidget(self.plot_hud_label)
         plot_layout.addWidget(self.plot_toolbar)
         plot_layout.addWidget(self.plot_canvas)
+
+        self.plot_canvas.mpl_connect("motion_notify_event", self._on_plot_canvas_hover)
+        self.plot_canvas.mpl_connect("axes_leave_event", self._on_plot_canvas_leave)
+        self.plot_canvas.mpl_connect("button_press_event", self._on_plot_canvas_click)
+
         self.preview_tabs.addTab(plot_panel, "Plot preview")
 
         table_panel = QWidget()
@@ -2374,6 +2755,7 @@ class MassLynxWindow(QMainWindow):
 
         splitter.addWidget(controls)
         splitter.addWidget(self.preview_tabs)
+        splitter.splitterMoved.connect(lambda *_: self._resize_timer.start())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setHandleWidth(12)
@@ -2650,6 +3032,12 @@ class MassLynxWindow(QMainWindow):
 
         toolbar_layout.addStretch(1)
 
+        self.console_level_combo = QComboBox()
+        self.console_level_combo.addItems(["All messages", "INFO and above", "Warnings & errors", "Errors only"])
+        self.console_level_combo.setToolTip("Filter console log entries by severity")
+        self.console_level_combo.currentIndexChanged.connect(self._refilter_console_lines)
+        toolbar_layout.addWidget(self.console_level_combo)
+
         self.console_autoscroll_checkbox = QCheckBox("Auto-scroll")
         self.console_autoscroll_checkbox.setChecked(True)
         toolbar_layout.addWidget(self.console_autoscroll_checkbox)
@@ -2720,10 +3108,40 @@ class MassLynxWindow(QMainWindow):
             return
         self._append_console_output(text, stream_type)
 
+    def _matches_console_filter(self, text: str, stream_type: str, filter_mode: int) -> bool:
+        if filter_mode == 0:
+            return True
+        upper = text.upper()
+        if filter_mode == 1:
+            return not ("[DEBUG]" in upper)
+        elif filter_mode == 2:
+            return any(tag in upper for tag in ("[WARN", "[ERROR", "[CRITICAL")) or stream_type == "stderr"
+        elif filter_mode == 3:
+            return any(tag in upper for tag in ("[ERROR", "[CRITICAL", "TRACEBACK")) or stream_type == "stderr"
+        return True
+
     def _append_console_output(self, text: str, stream_type: str = "stdout"):
-        self.console_text.moveCursor(QTextCursor.MoveOperation.End)
-        self.console_text.insertPlainText(text)
-        self._msg_count += text.count("\n") or 1
+        self._console_history.append((text, stream_type))
+        if len(self._console_history) > 6000:
+            self._console_history = self._console_history[-5000:]
+
+        filter_idx = self.console_level_combo.currentIndex() if hasattr(self, "console_level_combo") else 0
+        if self._matches_console_filter(text, stream_type, filter_idx):
+            self.console_text.moveCursor(QTextCursor.MoveOperation.End)
+            self.console_text.insertPlainText(text)
+            self._msg_count += text.count("\n") or 1
+            self.console_count_label.setText(f"{self._msg_count} lines")
+            if self.console_autoscroll_checkbox.isChecked():
+                self.console_text.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _refilter_console_lines(self):
+        filter_idx = self.console_level_combo.currentIndex()
+        self.console_text.clear()
+        self._msg_count = 0
+        for text, stream_type in self._console_history:
+            if self._matches_console_filter(text, stream_type, filter_idx):
+                self.console_text.insertPlainText(text)
+                self._msg_count += text.count("\n") or 1
         self.console_count_label.setText(f"{self._msg_count} lines")
         if self.console_autoscroll_checkbox.isChecked():
             self.console_text.moveCursor(QTextCursor.MoveOperation.End)
@@ -2734,6 +3152,7 @@ class MassLynxWindow(QMainWindow):
         self._append_console_output(formatted, level.lower())
 
     def _clear_console(self):
+        self._console_history.clear()
         self.console_text.clear()
         self._msg_count = 0
         self.console_count_label.setText("0 lines")
@@ -3473,6 +3892,7 @@ class MassLynxWindow(QMainWindow):
         signal_columns = [column for column in frame.columns if column != rt_column]
         selected = signal_columns if self.plot_all_checkbox.isChecked() else [self.plot_signal_combo.currentText()]
         x_values = pd.to_numeric(frame[rt_column], errors="coerce")
+        use_decimation = getattr(self, "perf_mode_checkbox", None) and self.perf_mode_checkbox.isChecked()
         plotted = 0
         for column in selected:
             if column not in signal_columns:
@@ -3480,7 +3900,11 @@ class MassLynxWindow(QMainWindow):
             y_values = pd.to_numeric(frame[column], errors="coerce")
             valid = x_values.notna() & y_values.notna()
             if valid.any():
-                self.axes.plot(x_values[valid], y_values[valid], label=str(column), linewidth=1.5)
+                x_pts = x_values[valid].to_numpy()
+                y_pts = y_values[valid].to_numpy()
+                if use_decimation and len(x_pts) > 10000:
+                    x_pts, y_pts = decimate_trace(x_pts, y_pts, max_points=10000)
+                self.axes.plot(x_pts, y_pts, label=str(column), linewidth=1.5)
                 plotted += 1
         self.axes.set_xlabel(str(rt_column))
         if self.plot_csv_type == "DAD":
@@ -3552,6 +3976,162 @@ class MassLynxWindow(QMainWindow):
         console_log(f"Exporting chromatogram plot to '{filename}' (DPI={dpi}, format={extension[1:].upper()})", category="UI-EXPORT")
         self.figure.savefig(filename, format=extension[1:], bbox_inches="tight", dpi=dpi)
         console_log(f"Plot exported successfully: {filename}", category="UI-EXPORT")
+
+    def _on_perf_mode_toggled(self, checked: bool):
+        self.settings.setValue("plot/perf_mode", checked)
+        console_log(f"Performance mode set to: {'Decimated (Fast)' if checked else 'Raw (High precision)'}", category="UI-PLOT")
+        self.update_plot()
+        if hasattr(self, "integration_preview_panel") and self.integration_preview_panel.isVisible():
+            self.update_integration_preview()
+
+    def _on_plot_canvas_hover(self, event):
+        if event.inaxes != self.axes or event.xdata is None or event.ydata is None:
+            return
+        x_val = event.xdata
+        y_val = event.ydata
+        is_mz_scan = self.plot_csv_type == "m/z" and hasattr(self, "plot_mz_axis_combo") and self.plot_mz_axis_combo.currentData() == "mz"
+        if is_mz_scan:
+            hud_text = f"m/z: {x_val:.2f} | Intensity: {y_val:.4g}"
+        else:
+            hud_text = f"RT: {x_val:.3f} min | Signal: {y_val:.4g}"
+        if hasattr(self, "plot_hud_label"):
+            self.plot_hud_label.setText(hud_text)
+        self.statusBar().showMessage(f"Cursor: {hud_text}", 1500)
+
+        # Draw / update vertical guideline
+        if self._plot_crosshair is None or self._plot_crosshair not in self.axes.lines:
+            self._plot_crosshair = self.axes.axvline(x_val, color="#64748b", linestyle=":", linewidth=0.9, alpha=0.8)
+        else:
+            self._plot_crosshair.set_xdata([x_val, x_val])
+            self._plot_crosshair.set_visible(True)
+        self.plot_canvas.draw_idle()
+
+    def _on_plot_canvas_leave(self, event):
+        if self._plot_crosshair is not None and self._plot_crosshair in self.axes.lines:
+            self._plot_crosshair.set_visible(False)
+            self.plot_canvas.draw_idle()
+        if hasattr(self, "plot_hud_label"):
+            self.plot_hud_label.setText("RT: -- | Signal: --")
+
+    def _on_plot_canvas_click(self, event):
+        if event.button != 1 or event.inaxes != self.axes or event.xdata is None:
+            return
+        picked_rt = round(event.xdata, 3)
+        self.center_edit.setText(f"{picked_rt:.3f}")
+        if not self.tol_minus_edit.text().strip():
+            self.tol_minus_edit.setText("0.200")
+        if not self.tol_plus_edit.text().strip():
+            self.tol_plus_edit.setText("0.200")
+        self.statusBar().showMessage(f"Selected RT {picked_rt:.3f} min as target center (Click 'Add target' to save)", 4000)
+        console_log(f"Picked retention time from plot canvas: RT={picked_rt:.3f} min", category="TARGETS")
+        if getattr(event, "dblclick", False):
+            self.add_target()
+
+    def _on_integration_canvas_hover(self, event):
+        if event.inaxes != self.integration_axes or event.xdata is None or event.ydata is None:
+            return
+        x_val = event.xdata
+        y_val = event.ydata
+        hud_text = f"RT: {x_val:.3f} min | Signal: {y_val:.4g}"
+        if hasattr(self, "integration_hud_label"):
+            self.integration_hud_label.setText(hud_text)
+        self.statusBar().showMessage(f"Cursor: {hud_text}", 1500)
+
+        # Draw / update vertical guideline
+        if self._integration_crosshair is None or self._integration_crosshair not in self.integration_axes.lines:
+            self._integration_crosshair = self.integration_axes.axvline(x_val, color="#64748b", linestyle=":", linewidth=0.9, alpha=0.8)
+        else:
+            self._integration_crosshair.set_xdata([x_val, x_val])
+            self._integration_crosshair.set_visible(True)
+        self.integration_canvas.draw_idle()
+
+    def _on_integration_canvas_leave(self, event):
+        if self._integration_crosshair is not None and self._integration_crosshair in self.integration_axes.lines:
+            self._integration_crosshair.set_visible(False)
+            self.integration_canvas.draw_idle()
+        if hasattr(self, "integration_hud_label"):
+            self.integration_hud_label.setText("RT: -- | Signal: --")
+
+    def _on_integration_canvas_click(self, event):
+        if event.button != 1 or event.inaxes != self.integration_axes or event.xdata is None:
+            return
+        picked_rt = round(event.xdata, 3)
+        self.center_edit.setText(f"{picked_rt:.3f}")
+        if not self.tol_minus_edit.text().strip():
+            self.tol_minus_edit.setText("0.200")
+        if not self.tol_plus_edit.text().strip():
+            self.tol_plus_edit.setText("0.200")
+        self.statusBar().showMessage(f"Selected RT {picked_rt:.3f} min as target center (Click 'Add target' to save)", 4000)
+        console_log(f"Picked retention time from integration canvas: RT={picked_rt:.3f} min", category="TARGETS")
+        if getattr(event, "dblclick", False):
+            self.add_target()
+
+    def export_integration_excel_clicked(self):
+        csv_folder = self.csv_folder_edit.text().strip()
+        eval_csv = os.path.join(csv_folder, "00_evaluated_data.csv")
+        if not os.path.isfile(eval_csv):
+            QMessageBox.warning(
+                self,
+                "No evaluated data",
+                "No '00_evaluated_data.csv' found in the current folder.\nPlease run peak integration first.",
+            )
+            return
+        default_xlsx = os.path.join(csv_folder, "00_evaluated_data.xlsx")
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export peak integration to Excel",
+            default_xlsx,
+            "Excel Workbook (*.xlsx)",
+        )
+        if not output_path:
+            return
+        if not output_path.lower().endswith(".xlsx"):
+            output_path += ".xlsx"
+        try:
+            export_evaluated_to_excel(eval_csv, self.targets, output_path)
+            QMessageBox.information(
+                self,
+                "Excel export complete",
+                f"Peak integration data was exported to Excel successfully:\n\n{output_path}",
+            )
+            self.statusBar().showMessage(f"Excel export complete: {output_path}")
+        except Exception as exc:
+            console_log(f"Excel export failed: {exc}", category="UI-EXPORT", level="ERROR")
+            QMessageBox.critical(self, "Export failed", str(exc))
+
+    def export_plot_table_excel_clicked(self):
+        if self.plot_dataframe is None or self.plot_dataframe.empty:
+            QMessageBox.warning(self, "No data", "No CSV dataset is currently loaded.")
+            return
+        folder = self.plot_folder_edit.text().strip() or os.getcwd()
+        selected_rows = self.plot_file_table.selectionModel().selectedRows()
+        base_name = "export_table.xlsx"
+        if selected_rows:
+            item = self.plot_file_table.item(selected_rows[0].row(), 0)
+            if item:
+                base_name = f"{os.path.splitext(item.text())[0]}.xlsx"
+        default_xlsx = os.path.join(folder, base_name)
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export table to Excel",
+            default_xlsx,
+            "Excel Workbook (*.xlsx)",
+        )
+        if not output_path:
+            return
+        if not output_path.lower().endswith(".xlsx"):
+            output_path += ".xlsx"
+        try:
+            export_evaluated_to_excel(self.plot_dataframe, self.targets, output_path)
+            QMessageBox.information(
+                self,
+                "Excel export complete",
+                f"Dataset exported to Excel successfully:\n\n{output_path}",
+            )
+            self.statusBar().showMessage(f"Excel export complete: {output_path}")
+        except Exception as exc:
+            console_log(f"Excel export failed: {exc}", category="UI-EXPORT", level="ERROR")
+            QMessageBox.critical(self, "Export failed", str(exc))
 
 
 # =============================================================================

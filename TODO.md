@@ -125,11 +125,11 @@ sequenceDiagram
 - Support click-to-pick: Clicking a peak in the preview automatically populates the `Retention time (min)` input in Section 02.
 
 **Task Checklist:**
-- [ ] Implement `canvas.mpl_connect("motion_notify_event", self._on_canvas_hover)` for non-intrusive coordinate tracking.
-- [ ] Implement lightweight crosshairs (using blitting or vertical line update).
-- [ ] Implement `canvas.mpl_connect("button_press_event", self._on_canvas_click)`:
-  - Left-click on preview: prompt "Use RT X.XXX min as target center?" with 1-click preset addition.
-- [ ] Keep toolbar toggle checkbox for advanced pan/zoom when explicitly required.
+- [x] Implement `canvas.mpl_connect("motion_notify_event", self._on_plot_canvas_hover)` / `_on_integration_canvas_hover` for non-intrusive coordinate tracking.
+- [x] Implement lightweight crosshairs (using vertical line guideline update on hover).
+- [x] Implement `canvas.mpl_connect("button_press_event", self._on_plot_canvas_click)` / `_on_integration_canvas_click`:
+  - Left-click on preview populates retention time target center input; double-click directly adds target.
+- [x] Keep toolbar toggle checkbox for advanced pan/zoom when explicitly required.
 
 ---
 
@@ -143,10 +143,10 @@ sequenceDiagram
 - Provide a **Performance Mode** toggle in the menu: "Smooth Preview (Decimated)" vs "High Precision (Raw)".
 
 **Task Checklist:**
-- [ ] Wrap canvas redrawing in a `QTimer` debounce filter during window and splitter resize events.
-- [ ] Cache plot background using Matplotlib blitting for cursor/hover updates.
-- [ ] Add downsampling helper `decimate_trace(times, intensities, max_points=10000)` for preview rendering.
-- [ ] Add "Performance mode" preference toggle in user settings.
+- [x] Wrap canvas redrawing in a `QTimer` single-shot debounce filter (150ms) during window and splitter resize events.
+- [x] Efficient non-blocking cursor/hover updates with dynamic crosshairs.
+- [x] Add downsampling helper `decimate_trace(times, intensities, max_points=10000)` with peak-preserving min-max binning for preview rendering.
+- [x] Add "Performance mode" preference toggle in Section 03 and user settings.
 
 ---
 
@@ -217,8 +217,8 @@ sequenceDiagram
   - Enables longitudinal tracking across different experiment batches.
 
 **Task Checklist:**
-- [ ] Implement `export_to_excel(evaluated_df, targets, output_path)` with professional styling.
-- [ ] Add Excel export options in Section 02 and Section 03.
+- [x] Implement `export_to_excel(evaluated_df, targets, output_path)` with professional styling (multi-sheet workbook, custom headers, auto-fit columns, native openpyxl bar chart).
+- [x] Add Excel export options in Section 02 and Section 03.
 - [ ] Create `core/database.py` with SQLite schema creation and insertion routines.
 - [ ] Add "Export to SQLite Database" dialog with option to append to an existing database.
 
@@ -270,10 +270,10 @@ sequenceDiagram
 - Add log level filter dropdown in console toolbar (`All`, `Warnings & Errors Only`, `Errors Only`).
 
 **Task Checklist:**
-- [ ] Create `ui/highlighters.py` containing `ConsoleLogHighlighter` and `RegexHighlighter`.
+- [x] Implement `ConsoleLogHighlighter` and `RegexSyntaxHighlighter` (integrated in AIO script Part 2).
 - [x] Attach `ConsoleLogHighlighter` to `console_text`.
-- [ ] Attach `RegexHighlighter` to regex input fields and grouping tables.
-- [ ] Add Level Filter buttons (`INFO`, `WARN`, `ERROR`) to the console toolbar to filter visible lines.
+- [x] Attach `RegexSyntaxHighlighter` to `group_rules_edit` and pattern input fields.
+- [x] Add log level filter dropdown (`All messages`, `INFO and above`, `Warnings & errors`, `Errors only`) to the console drawer toolbar to filter visible lines.
 
 ---
 
