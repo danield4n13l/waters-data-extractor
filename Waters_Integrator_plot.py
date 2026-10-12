@@ -1426,6 +1426,7 @@ class MassLynxWindow(QMainWindow):
         self.target_table.setHorizontalHeaderLabels(["Center (min)", "Tol -", "Tol +"])
         self.target_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.target_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.target_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.target_table.setMaximumHeight(150)
         target_row.addWidget(self.target_table, 1)
         target_actions = QVBoxLayout()
@@ -1736,7 +1737,9 @@ class MassLynxWindow(QMainWindow):
             row = self.target_table.rowCount()
             self.target_table.insertRow(row)
             for column, value in enumerate(values):
-                self.target_table.setItem(row, column, QTableWidgetItem(f"{value:.3f}"))
+                target_item = QTableWidgetItem(f"{value:.3f}")
+                target_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.target_table.setItem(row, column, target_item)
         self.plot_folder_edit.setText(self.csv_folder_edit.text())
         if os.path.isdir(self.raw_root_edit.text()):
             self.refresh_raw_preview()
@@ -2366,7 +2369,9 @@ class MassLynxWindow(QMainWindow):
         row = self.target_table.rowCount()
         self.target_table.insertRow(row)
         for column, value in enumerate((center, tol_minus, tol_plus)):
-            self.target_table.setItem(row, column, QTableWidgetItem(f"{value:.3f}"))
+            target_item = QTableWidgetItem(f"{value:.3f}")
+            target_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.target_table.setItem(row, column, target_item)
         self.center_edit.clear()
         self.tol_minus_edit.clear()
         self.tol_plus_edit.clear()

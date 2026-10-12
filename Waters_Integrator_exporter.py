@@ -1147,6 +1147,7 @@ class WatersExporterWindow(QMainWindow):
         self.dataset_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.dataset_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.dataset_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.dataset_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.dataset_table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self.dataset_table.setMinimumHeight(240)
         left_layout.addWidget(self.dataset_table, 1)
@@ -1163,6 +1164,7 @@ class WatersExporterWindow(QMainWindow):
         right_layout.addWidget(self.preview_header_label)
 
         self.data_preview_table = QTableWidget(0, 0)
+        self.data_preview_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.data_preview_table.setMinimumHeight(240)
         right_layout.addWidget(self.data_preview_table, 1)
 
