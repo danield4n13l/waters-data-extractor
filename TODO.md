@@ -271,7 +271,7 @@ sequenceDiagram
 
 **Task Checklist:**
 - [ ] Create `ui/highlighters.py` containing `ConsoleLogHighlighter` and `RegexHighlighter`.
-- [ ] Attach `ConsoleLogHighlighter` to `console_text`.
+- [x] Attach `ConsoleLogHighlighter` to `console_text`.
 - [ ] Attach `RegexHighlighter` to regex input fields and grouping tables.
 - [ ] Add Level Filter buttons (`INFO`, `WARN`, `ERROR`) to the console toolbar to filter visible lines.
 
