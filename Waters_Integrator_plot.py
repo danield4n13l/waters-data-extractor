@@ -910,7 +910,12 @@ def classify_csv_type(path: str, headers=None) -> str:
             return "TIC"
 
         # 3. Read headers if not provided
-        if headers is None:
+        if headers is not None:
+            try:
+                headers = list(headers)
+            except Exception:
+                headers = []
+        else:
             if not os.path.isfile(path):
                 return "CSV"
             try:
@@ -935,7 +940,7 @@ def classify_csv_type(path: str, headers=None) -> str:
                 except Exception:
                     headers = []
 
-        normalized_headers = [str(h).strip().casefold() for h in (headers or [])]
+        normalized_headers = [str(h).strip().casefold() for h in (headers if headers is not None else [])]
 
         # 4. Check for Integrated areas from column structure
         if normalized_headers and normalized_headers[0] in {
@@ -1028,6 +1033,64 @@ def decimate_trace(times, intensities, max_points: int = 10000) -> Tuple[list, l
             out_intensities.append(float(intens_arr[min_pos]))
 
     return out_times, out_intensities
+
+
+def interpolate_axes_fx(
+    axes,
+    x_val: float,
+    exclude_lines=(),
+    preferred_label: Optional[str] = None,
+) -> Tuple[List[Tuple[str, float]], Optional[float]]:
+    """
+    Interpolate curve value(s) f(x) for the given x on the matplotlib axes.
+    Returns:
+        (list of (label, f(x)), primary_f_x)
+    """
+    results: List[Tuple[str, float]] = []
+    for line in axes.lines:
+        if line in exclude_lines:
+            continue
+        label = line.get_label() or ""
+        if label.startswith("_"):
+            label = ""
+        x_data = line.get_xdata()
+        y_data = line.get_ydata()
+        if x_data is None or len(x_data) < 2:
+            continue
+        x_arr = np.asarray(x_data, dtype=float)
+        y_arr = np.asarray(y_data, dtype=float)
+        valid = np.isfinite(x_arr) & np.isfinite(y_arr)
+        if not np.any(valid):
+            continue
+        x_valid = x_arr[valid]
+        y_valid = y_arr[valid]
+        x_min, x_max = float(np.min(x_valid)), float(np.max(x_valid))
+        if x_val < x_min or x_val > x_max:
+            continue
+        if len(x_valid) > 1 and np.any(np.diff(x_valid) < 0):
+            sort_idx = np.argsort(x_valid)
+            x_valid = x_valid[sort_idx]
+            y_valid = y_valid[sort_idx]
+        f_val = float(np.interp(x_val, x_valid, y_valid))
+        results.append((label, f_val))
+
+    if not results and axes.patches:
+        for p in axes.patches:
+            rx = p.get_x()
+            rw = p.get_width()
+            if rx <= x_val <= rx + rw:
+                results.append(("", float(p.get_height())))
+                break
+
+    primary_val: Optional[float] = None
+    if results:
+        if preferred_label:
+            match = next((val for lbl, val in results if lbl == preferred_label), None)
+            primary_val = match if match is not None else results[0][1]
+        else:
+            primary_val = results[0][1]
+
+    return results, primary_val
 
 
 def moving_average(seq, window=5):
@@ -1778,9 +1841,11 @@ class MassLynxWindow(QMainWindow):
         self._resize_timer.setInterval(150)
         self._resize_timer.timeout.connect(self._on_debounced_resize)
 
-        # Plot cursor guidelines and console buffer
+        # Plot cursor guidelines, tracker markers and console buffer
         self._plot_crosshair = None
+        self._plot_marker = None
         self._integration_crosshair = None
+        self._integration_marker = None
         self._console_history: List[Tuple[str, str]] = []
 
         self._build_ui()
@@ -3672,7 +3737,11 @@ class MassLynxWindow(QMainWindow):
 
         self.plot_dataframe = frame
         type_item = self.plot_file_table.item(row_idx, 1)
-        self.plot_csv_type = classify_csv_type(path, frame.columns)
+        detected_type = classify_csv_type(path, frame.columns)
+        if detected_type != "CSV" or not type_item or type_item.text() == "CSV":
+            self.plot_csv_type = detected_type
+        else:
+            self.plot_csv_type = type_item.text()
         if type_item is not None:
             type_item.setText(self.plot_csv_type)
         if self.plot_csv_type == "Integrated areas":
@@ -3990,10 +4059,26 @@ class MassLynxWindow(QMainWindow):
         x_val = event.xdata
         y_val = event.ydata
         is_mz_scan = self.plot_csv_type == "m/z" and hasattr(self, "plot_mz_axis_combo") and self.plot_mz_axis_combo.currentData() == "mz"
+
+        active_sig = self.plot_signal_combo.currentText().strip() if hasattr(self, "plot_signal_combo") else None
+        exclude = (self._plot_crosshair, self._plot_marker)
+        curve_pts, primary_f = interpolate_axes_fx(self.axes, x_val, exclude_lines=exclude, preferred_label=active_sig)
+
+        fx_desc = ""
+        if primary_f is not None:
+            if len(curve_pts) > 1 and getattr(self, "plot_all_checkbox", None) and self.plot_all_checkbox.isChecked():
+                items = [f"{lbl}={val:.4g}" if lbl else f"{val:.4g}" for lbl, val in curve_pts[:3]]
+                if len(curve_pts) > 3:
+                    items.append(f"+{len(curve_pts)-3} more")
+                fx_desc = f" | f(x): [{', '.join(items)}]"
+            else:
+                unit = " AU" if self.plot_csv_type == "DAD" else ""
+                fx_desc = f" | f(x): {primary_f:.4g}{unit}"
+
         if is_mz_scan:
-            hud_text = f"m/z: {x_val:.2f} | Intensity: {y_val:.4g}"
+            hud_text = f"m/z: {x_val:.2f} | Cursor: {y_val:.4g}{fx_desc}"
         else:
-            hud_text = f"RT: {x_val:.3f} min | Signal: {y_val:.4g}"
+            hud_text = f"RT: {x_val:.3f} min | Cursor: {y_val:.4g}{fx_desc}"
         if hasattr(self, "plot_hud_label"):
             self.plot_hud_label.setText(hud_text)
         self.statusBar().showMessage(f"Cursor: {hud_text}", 1500)
@@ -4004,35 +4089,46 @@ class MassLynxWindow(QMainWindow):
         else:
             self._plot_crosshair.set_xdata([x_val, x_val])
             self._plot_crosshair.set_visible(True)
+
+        # Draw / update curve tracker marker
+        if primary_f is not None:
+            if self._plot_marker is None or self._plot_marker not in self.axes.lines:
+                self._plot_marker = self.axes.plot([x_val], [primary_f], "o", color="#ef4444", markersize=4.5, zorder=8)[0]
+            else:
+                self._plot_marker.set_data([x_val], [primary_f])
+                self._plot_marker.set_visible(True)
+        elif self._plot_marker is not None and self._plot_marker in self.axes.lines:
+            self._plot_marker.set_visible(False)
+
         self.plot_canvas.draw_idle()
 
     def _on_plot_canvas_leave(self, event):
         if self._plot_crosshair is not None and self._plot_crosshair in self.axes.lines:
             self._plot_crosshair.set_visible(False)
-            self.plot_canvas.draw_idle()
+        if self._plot_marker is not None and self._plot_marker in self.axes.lines:
+            self._plot_marker.set_visible(False)
+        self.plot_canvas.draw_idle()
         if hasattr(self, "plot_hud_label"):
             self.plot_hud_label.setText("RT: -- | Signal: --")
 
     def _on_plot_canvas_click(self, event):
-        if event.button != 1 or event.inaxes != self.axes or event.xdata is None:
-            return
-        picked_rt = round(event.xdata, 3)
-        self.center_edit.setText(f"{picked_rt:.3f}")
-        if not self.tol_minus_edit.text().strip():
-            self.tol_minus_edit.setText("0.200")
-        if not self.tol_plus_edit.text().strip():
-            self.tol_plus_edit.setText("0.200")
-        self.statusBar().showMessage(f"Selected RT {picked_rt:.3f} min as target center (Click 'Add target' to save)", 4000)
-        console_log(f"Picked retention time from plot canvas: RT={picked_rt:.3f} min", category="TARGETS")
-        if getattr(event, "dblclick", False):
-            self.add_target()
+        # Retention time picking is exclusive to the integration checker on double-click
+        pass
 
     def _on_integration_canvas_hover(self, event):
         if event.inaxes != self.integration_axes or event.xdata is None or event.ydata is None:
             return
         x_val = event.xdata
         y_val = event.ydata
-        hud_text = f"RT: {x_val:.3f} min | Signal: {y_val:.4g}"
+
+        exclude = (self._integration_crosshair, self._integration_marker)
+        curve_pts, primary_f = interpolate_axes_fx(self.integration_axes, x_val, exclude_lines=exclude)
+
+        fx_desc = ""
+        if primary_f is not None:
+            fx_desc = f" | f(x): {primary_f:.4g}"
+
+        hud_text = f"RT: {x_val:.3f} min | Cursor: {y_val:.4g}{fx_desc}"
         if hasattr(self, "integration_hud_label"):
             self.integration_hud_label.setText(hud_text)
         self.statusBar().showMessage(f"Cursor: {hud_text}", 1500)
@@ -4043,17 +4139,32 @@ class MassLynxWindow(QMainWindow):
         else:
             self._integration_crosshair.set_xdata([x_val, x_val])
             self._integration_crosshair.set_visible(True)
+
+        # Draw / update curve tracker marker
+        if primary_f is not None:
+            if self._integration_marker is None or self._integration_marker not in self.integration_axes.lines:
+                self._integration_marker = self.integration_axes.plot([x_val], [primary_f], "o", color="#ef4444", markersize=4.5, zorder=8)[0]
+            else:
+                self._integration_marker.set_data([x_val], [primary_f])
+                self._integration_marker.set_visible(True)
+        elif self._integration_marker is not None and self._integration_marker in self.integration_axes.lines:
+            self._integration_marker.set_visible(False)
+
         self.integration_canvas.draw_idle()
 
     def _on_integration_canvas_leave(self, event):
         if self._integration_crosshair is not None and self._integration_crosshair in self.integration_axes.lines:
             self._integration_crosshair.set_visible(False)
-            self.integration_canvas.draw_idle()
+        if self._integration_marker is not None and self._integration_marker in self.integration_axes.lines:
+            self._integration_marker.set_visible(False)
+        self.integration_canvas.draw_idle()
         if hasattr(self, "integration_hud_label"):
             self.integration_hud_label.setText("RT: -- | Signal: --")
 
     def _on_integration_canvas_click(self, event):
         if event.button != 1 or event.inaxes != self.integration_axes or event.xdata is None:
+            return
+        if not getattr(event, "dblclick", False):
             return
         picked_rt = round(event.xdata, 3)
         self.center_edit.setText(f"{picked_rt:.3f}")
@@ -4062,9 +4173,7 @@ class MassLynxWindow(QMainWindow):
         if not self.tol_plus_edit.text().strip():
             self.tol_plus_edit.setText("0.200")
         self.statusBar().showMessage(f"Selected RT {picked_rt:.3f} min as target center (Click 'Add target' to save)", 4000)
-        console_log(f"Picked retention time from integration canvas: RT={picked_rt:.3f} min", category="TARGETS")
-        if getattr(event, "dblclick", False):
-            self.add_target()
+        console_log(f"Picked retention time from integration checker: RT={picked_rt:.3f} min", category="TARGETS")
 
     def export_integration_excel_clicked(self):
         csv_folder = self.csv_folder_edit.text().strip()
