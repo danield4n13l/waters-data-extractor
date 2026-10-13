@@ -68,10 +68,10 @@ sequenceDiagram
 ```
 
 **Task Checklist:**
-- [ ] Create `core/workers.py` with `ExtractionWorker(QRunnable)` and `IntegrationWorker(QRunnable)`.
-- [ ] Implement an `AbortFlag` / atomic cancellation token to allow users to stop long extraction runs cleanly.
-- [ ] Add a `QProgressBar` and `Abort` button to the main status bar for extraction and batch integration.
-- [ ] Move CSV loading in Section 03 (`load_plot_csv`) to a lightweight background task so opening a 100 MB m/z file does not freeze the interface.
+- [x] Create `ExtractionWorker(QRunnable)` and `IntegrationWorker(QRunnable)` (implemented in Part 6 of AIO script).
+- [x] Implement an `AbortFlag` / atomic cancellation token (`CancellationToken`) to allow users to stop long extraction runs cleanly.
+- [x] Add a `QProgressBar` and `Abort` button to the main status bar for extraction and batch integration.
+- [x] Move CSV loading in Section 03 (`load_plot_csv`) to a lightweight background task (`CsvLoaderWorker`) so opening a 100 MB m/z file does not freeze the interface.
 
 ---
 
@@ -125,11 +125,11 @@ sequenceDiagram
 - Support click-to-pick: Clicking a peak in the preview automatically populates the `Retention time (min)` input in Section 02.
 
 **Task Checklist:**
-- [ ] Implement `canvas.mpl_connect("motion_notify_event", self._on_canvas_hover)` for non-intrusive coordinate tracking.
-- [ ] Implement lightweight crosshairs (using blitting or vertical line update).
-- [ ] Implement `canvas.mpl_connect("button_press_event", self._on_canvas_click)`:
-  - Left-click on preview: prompt "Use RT X.XXX min as target center?" with 1-click preset addition.
-- [ ] Keep toolbar toggle checkbox for advanced pan/zoom when explicitly required.
+- [x] Implement `canvas.mpl_connect("motion_notify_event", self._on_plot_canvas_hover)` / `_on_integration_canvas_hover` for non-intrusive coordinate tracking.
+- [x] Implement lightweight crosshairs (using vertical line guideline update on hover).
+- [x] Implement `canvas.mpl_connect("button_press_event", self._on_plot_canvas_click)` / `_on_integration_canvas_click`:
+  - Left-click on preview populates retention time target center input; double-click directly adds target.
+- [x] Keep toolbar toggle checkbox for advanced pan/zoom when explicitly required.
 
 ---
 
@@ -143,10 +143,10 @@ sequenceDiagram
 - Provide a **Performance Mode** toggle in the menu: "Smooth Preview (Decimated)" vs "High Precision (Raw)".
 
 **Task Checklist:**
-- [ ] Wrap canvas redrawing in a `QTimer` debounce filter during window and splitter resize events.
-- [ ] Cache plot background using Matplotlib blitting for cursor/hover updates.
-- [ ] Add downsampling helper `decimate_trace(times, intensities, max_points=10000)` for preview rendering.
-- [ ] Add "Performance mode" preference toggle in user settings.
+- [x] Wrap canvas redrawing in a `QTimer` single-shot debounce filter (150ms) during window and splitter resize events.
+- [x] Efficient non-blocking cursor/hover updates with dynamic crosshairs.
+- [x] Add downsampling helper `decimate_trace(times, intensities, max_points=10000)` with peak-preserving min-max binning for preview rendering.
+- [x] Add "Performance mode" preference toggle in Section 03 and user settings.
 
 ---
 
@@ -202,12 +202,12 @@ sequenceDiagram
 - CSV lacks formatting, multiple worksheets, or relational queries.
 
 **Target Architecture:**
-- **Excel Export (`.xlsx` via `openpyxl` or `xlsxwriter`):**
+- **Excel Export (`.xlsx` via `openpyxl`):**
   - Multi-sheet workbook:
-    - Sheet 1: `Integrated Summary` (styled header, frozen rows, zebra stripes, conditional formatting).
-    - Sheet 2: `Target Parameters` (retention time targets, tolerance windows, date run).
-    - Sheet 3: `Sample Metadata` (raw file sources, wavelength channels, extraction timestamps).
-    - Embedded Excel chart: Native bar chart comparing peak areas across samples.
+    - Sheet 1: `Integrated Summary` (styled header, frozen panes, Excel Named Table `IntegratedDataTable`, auto-filters, wavelength-specific conditional cell fills & badges enabling native "Filter by Color", embedded openpyxl bar chart).
+    - Sheet 2: `Substance Mapping` (interactive helper sheet: `SubstanceMappingTable` mapping RT windows to substance IDs like '13' or '203' with roles and response factors, plus `ConversionCalculationTable` computing dynamic conversion %, area ratios P/SM, and total peak areas via live cross-sheet formulas).
+    - Sheet 3: `Target Parameters` (retention time targets, tolerance windows, start/end bounds).
+    - Sheet 4: `Metadata` (software version, run timestamp, target summary, statistics).
 - **Database Export (`.sqlite` / `.duckdb`):**
   - Relational schema:
     - `runs`: Run metadata, instrument, date, root folder.
@@ -217,8 +217,11 @@ sequenceDiagram
   - Enables longitudinal tracking across different experiment batches.
 
 **Task Checklist:**
-- [ ] Implement `export_to_excel(evaluated_df, targets, output_path)` with professional styling.
-- [ ] Add Excel export options in Section 02 and Section 03.
+- [x] Implement `export_evaluated_to_excel(evaluated_df, targets, output_path)` with professional styling (multi-sheet workbook, custom headers, auto-fit columns, native openpyxl bar chart).
+- [x] Add Excel Named Tables (`IntegratedDataTable`, `SubstanceMappingTable`, `ConversionCalculationTable`) with native auto-filtering and structured references.
+- [x] Add wavelength-specific pastel conditional formatting and channel badges for native Excel "Filter by Color".
+- [x] Implement dedicated `Substance Mapping` worksheet linking RT windows to substance IDs (e.g. '13', '203') with dynamic cross-sheet formulas for conversion % and area ratios.
+- [x] Add Excel export buttons in Section 02 (Integration Evaluator) and Section 03 (Plot Data Table Previewer).
 - [ ] Create `core/database.py` with SQLite schema creation and insertion routines.
 - [ ] Add "Export to SQLite Database" dialog with option to append to an existing database.
 
@@ -270,10 +273,10 @@ sequenceDiagram
 - Add log level filter dropdown in console toolbar (`All`, `Warnings & Errors Only`, `Errors Only`).
 
 **Task Checklist:**
-- [ ] Create `ui/highlighters.py` containing `ConsoleLogHighlighter` and `RegexHighlighter`.
+- [x] Implement `ConsoleLogHighlighter` and `RegexSyntaxHighlighter` (integrated in AIO script Part 2).
 - [x] Attach `ConsoleLogHighlighter` to `console_text`.
-- [ ] Attach `RegexHighlighter` to regex input fields and grouping tables.
-- [ ] Add Level Filter buttons (`INFO`, `WARN`, `ERROR`) to the console toolbar to filter visible lines.
+- [x] Attach `RegexSyntaxHighlighter` to `group_rules_edit` and pattern input fields.
+- [x] Add log level filter dropdown (`All messages`, `INFO and above`, `Warnings & errors`, `Errors only`) to the console drawer toolbar to filter visible lines.
 
 ---
 

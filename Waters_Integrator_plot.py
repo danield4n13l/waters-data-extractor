@@ -13,12 +13,36 @@ import datetime
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import subprocess
-from typing import List, Optional
+import threading
+from typing import List, Optional, Tuple, Dict, Any, Callable
 
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import QObject, QSettings, Qt, Signal, QTime, QUrl, QSize
+import numpy as np
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font as XlsxFont, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+from PySide6.QtCore import (
+    QObject,
+    QSettings,
+    Qt,
+    Signal,
+    QTime,
+    QUrl,
+    QSize,
+    QRunnable,
+    QThreadPool,
+    QTimer,
+)
 from PySide6.QtGui import (
     QColor,
     QPalette,
@@ -49,6 +73,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -68,9 +93,9 @@ from PySide6.QtWidgets import (
 )
 from rainbow.waters import masslynx
 
-# ---------------------------
-# Utility helpers & logging
-# ---------------------------
+# =============================================================================
+# PART 1: LOGGING, PERSISTENCE & UTILITY CORE
+# =============================================================================
 
 def console_log(message: str, category: str = "APP", level: str = "INFO"):
     """
@@ -222,9 +247,9 @@ def record_processed_runs(run_items: List[tuple]):
     console_log(f"Recorded {len(run_items)} raw run(s) in processed history database", category="HISTORY")
 
 
-# ---------------------------
-# Console syntax highlighting
-# ---------------------------
+# =============================================================================
+# PART 2: CONSOLE LOG HIGHLIGHTING & PARSING UTILITIES
+# =============================================================================
 
 class ConsoleLogHighlighter(QSyntaxHighlighter):
     """
@@ -305,6 +330,87 @@ class ConsoleLogHighlighter(QSyntaxHighlighter):
             for match in pattern.finditer(text):
                 start, end = match.span()
                 self.setFormat(start, end - start, fmt)
+
+
+class RegexSyntaxHighlighter(QSyntaxHighlighter):
+    """
+    Syntax highlighter for regular expression and wildcard group mapping rules.
+    Provides colorful distinctions for capture groups, character classes,
+    quantifiers, anchors, mapping arrows (=>), and replacement targets.
+    """
+
+    def __init__(self, document, is_dark: bool = True):
+        super().__init__(document)
+        self.is_dark = is_dark
+        self._init_rules()
+
+    def set_dark_mode(self, is_dark: bool):
+        if self.is_dark != is_dark:
+            self.is_dark = is_dark
+            self._init_rules()
+            self.rehighlight()
+
+    def _init_rules(self):
+        self.rules = []
+
+        # 1. Named capture groups: (?P<name>...), (?P=name)
+        fmt_group = QTextCharFormat()
+        fmt_group.setForeground(QColor("#d2a8ff" if self.is_dark else "#8250df"))
+        fmt_group.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"\(\?P<[a-zA-Z_]\w*>[^)]*\)|\(\?P=[a-zA-Z_]\w*\)"), fmt_group))
+
+        # 2. Backreferences and group expansions: \g<name>, \g<1>, \1, \2
+        fmt_backref = QTextCharFormat()
+        fmt_backref.setForeground(QColor("#c084fc" if self.is_dark else "#7c3aed"))
+        fmt_backref.setFontWeight(QFont.Weight.DemiBold)
+        self.rules.append((re.compile(r"\\g<[a-zA-Z0-9_]+>|\\\d+"), fmt_backref))
+
+        # 3. Escape sequences: \d, \w, \s, \b, \D, \W, \S, \., \\
+        fmt_escape = QTextCharFormat()
+        fmt_escape.setForeground(QColor("#facc15" if self.is_dark else "#ca8a04"))
+        fmt_escape.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"\\[dwsbDWBS.^\$*+?|()[\]{}]"), fmt_escape))
+
+        # 4. Character sets / classes: [a-z], [^0-9], etc.
+        fmt_class = QTextCharFormat()
+        fmt_class.setForeground(QColor("#fb923c" if self.is_dark else "#ea580c"))
+        self.rules.append((re.compile(r"\[(?:\^)?(?:[^\]\\]|\\.)*\]"), fmt_class))
+
+        # 5. Quantifiers: *, +, ?, {m,n}, {n}
+        fmt_quant = QTextCharFormat()
+        fmt_quant.setForeground(QColor("#4ade80" if self.is_dark else "#16a34a"))
+        fmt_quant.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"[*+?]|{\d+(?:,\d*)?}"), fmt_quant))
+
+        # 6. Anchors: ^, $
+        fmt_anchor = QTextCharFormat()
+        fmt_anchor.setForeground(QColor("#f87171" if self.is_dark else "#dc2626"))
+        fmt_anchor.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"[\^$]"), fmt_anchor))
+
+        # 7. Parentheses / groups: (, )
+        fmt_paren = QTextCharFormat()
+        fmt_paren.setForeground(QColor("#38bdf8" if self.is_dark else "#0284c7"))
+        self.rules.append((re.compile(r"[()]"), fmt_paren))
+
+        # 8. Rule delimiter arrow: => or ->
+        fmt_arrow = QTextCharFormat()
+        fmt_arrow.setForeground(QColor("#fb7185" if self.is_dark else "#e11d48"))
+        fmt_arrow.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((re.compile(r"=>|->"), fmt_arrow))
+
+        # 9. Comments: # ...
+        fmt_comment = QTextCharFormat()
+        fmt_comment.setForeground(QColor("#64748b" if self.is_dark else "#94a3b8"))
+        fmt_comment.setFontItalic(True)
+        self.rules.append((re.compile(r"#.*$"), fmt_comment))
+
+    def highlightBlock(self, text: str):
+        for pattern, fmt in self.rules:
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                self.setFormat(start, end - start, fmt)
+
 
 
 def sanitize_filename(name: str, default: str = "sample") -> str:
@@ -415,9 +521,9 @@ def match_group(raw_name: str, rules: List[tuple], match_mode: str) -> Optional[
     return None
 
 
-# ---------------------------
-# MassLynx extraction helpers
-# ---------------------------
+# =============================================================================
+# PART 3: RAW DATA EXTRACTION & MASSLYNX PARSER CORE
+# =============================================================================
 
 def iter_raw_dirs(root: str) -> List[str]:
     """
@@ -560,6 +666,7 @@ def extract_masslynx_folder(
     group_rules: Optional[List[tuple]] = None,
     match_mode: str = "Regex",
     run_items: Optional[List[tuple]] = None,
+    token: Optional["CancellationToken"] = None,
 ) -> str:
     """
     Extract MassLynx .raw folders beneath 'root' into:
@@ -569,6 +676,7 @@ def extract_masslynx_folder(
 
     If run_items is provided, only extracts the specified [(raw_dir, dest_override), ...] entries.
     Returns the path to the chromatographic folder (chrom_dir).
+    Supports thread-safe cancellation via CancellationToken.
     """
     root = os.path.abspath(root)
     out_root = os.path.join(root, "csvs")
@@ -595,19 +703,31 @@ def extract_masslynx_folder(
         console_log(f"Merge wavelengths requested: {', '.join(merge_wavelengths)} nm", category="EXTRACT")
 
     if status_cb:
-        status_cb(f"Extracting {len(target_runs)} .raw folder(s)...")
+        try:
+            status_cb("Starting extraction...", 0, len(target_runs))
+        except TypeError:
+            status_cb(f"Extracting {len(target_runs)} .raw folder(s)...")
 
     processed = 0
     failed = 0
     successfully_processed = []
 
     for idx, (raw_dir, dest_override) in enumerate(target_runs):
+        if token and token.is_cancelled():
+            console_log(f"Extraction aborted by user after {processed} sample(s).", category="EXTRACT", level="WARN")
+            if successfully_processed:
+                record_processed_runs(successfully_processed)
+            raise InterruptedError("Extraction aborted by user.")
+
         base_raw = os.path.basename(raw_dir)
         base_name = base_raw[:-4] if base_raw.lower().endswith(".raw") else base_raw
         base_name = sanitize_filename(base_name, default="sample")
 
         if status_cb:
-            status_cb(f"[{idx+1}/{len(target_runs)}] {base_raw}")
+            try:
+                status_cb(base_raw, idx + 1, len(target_runs))
+            except TypeError:
+                status_cb(f"[{idx+1}/{len(target_runs)}] {base_raw}")
 
         func001 = None
         func002 = None
@@ -655,14 +775,17 @@ def extract_masslynx_folder(
 
     msg = f"Done: processed {processed}, failed {failed}."
     if status_cb:
-        status_cb(msg)
+        try:
+            status_cb(msg, processed, len(target_runs))
+        except TypeError:
+            status_cb(msg)
     console_log(f"Extraction completed: {processed} succeeded, {failed} failed. Chromatogram output: {chrom_dir}", category="EXTRACT")
     return chrom_dir
 
 
-# ---------------------------
-# Integration helpers
-# ---------------------------
+# =============================================================================
+# PART 4: CHROMATOGRAPHIC ANALYSIS & PEAK INTEGRATION CORE
+# =============================================================================
 
 def read_chrom_csv(path: str):
     """
@@ -788,7 +911,12 @@ def classify_csv_type(path: str, headers=None) -> str:
             return "TIC"
 
         # 3. Read headers if not provided
-        if headers is None:
+        if headers is not None:
+            try:
+                headers = list(headers)
+            except Exception:
+                headers = []
+        else:
             if not os.path.isfile(path):
                 return "CSV"
             try:
@@ -813,7 +941,7 @@ def classify_csv_type(path: str, headers=None) -> str:
                 except Exception:
                     headers = []
 
-        normalized_headers = [str(h).strip().casefold() for h in (headers or [])]
+        normalized_headers = [str(h).strip().casefold() for h in (headers if headers is not None else [])]
 
         # 4. Check for Integrated areas from column structure
         if normalized_headers and normalized_headers[0] in {
@@ -861,6 +989,109 @@ def classify_csv_type(path: str, headers=None) -> str:
         return "CSV"
     except Exception:
         return "CSV"
+
+
+def decimate_trace(times, intensities, max_points: int = 10000) -> Tuple[list, list]:
+    """
+    Downsample a chromatographic trace while strictly preserving peak extrema.
+    Uses min-max envelope binning to ensure apexes and narrow peaks are not missed.
+    If len(times) <= max_points, returns (times, intensities) unchanged.
+    """
+    n = len(times)
+    if n <= max_points or max_points < 4:
+        return list(times), list(intensities)
+
+    num_bins = max_points // 2
+    bin_size = n / num_bins
+    out_times = []
+    out_intensities = []
+
+    times_arr = np.asarray(times)
+    intens_arr = np.asarray(intensities)
+
+    for b in range(num_bins):
+        start_idx = int(b * bin_size)
+        end_idx = int((b + 1) * bin_size) if b < num_bins - 1 else n
+        if start_idx >= end_idx:
+            continue
+        bin_intens = intens_arr[start_idx:end_idx]
+        min_pos = int(np.argmin(bin_intens)) + start_idx
+        max_pos = int(np.argmax(bin_intens)) + start_idx
+
+        # Preserve chronological order within the bin
+        if min_pos < max_pos:
+            out_times.append(float(times_arr[min_pos]))
+            out_intensities.append(float(intens_arr[min_pos]))
+            out_times.append(float(times_arr[max_pos]))
+            out_intensities.append(float(intens_arr[max_pos]))
+        elif min_pos > max_pos:
+            out_times.append(float(times_arr[max_pos]))
+            out_intensities.append(float(intens_arr[max_pos]))
+            out_times.append(float(times_arr[min_pos]))
+            out_intensities.append(float(intens_arr[min_pos]))
+        else:
+            out_times.append(float(times_arr[min_pos]))
+            out_intensities.append(float(intens_arr[min_pos]))
+
+    return out_times, out_intensities
+
+
+def interpolate_axes_fx(
+    axes,
+    x_val: float,
+    exclude_lines=(),
+    preferred_label: Optional[str] = None,
+) -> Tuple[List[Tuple[str, float]], Optional[float]]:
+    """
+    Interpolate curve value(s) f(x) for the given x on the matplotlib axes.
+    Returns:
+        (list of (label, f(x)), primary_f_x)
+    """
+    results: List[Tuple[str, float]] = []
+    for line in axes.lines:
+        if line in exclude_lines:
+            continue
+        label = line.get_label() or ""
+        if label.startswith("_"):
+            label = ""
+        x_data = line.get_xdata()
+        y_data = line.get_ydata()
+        if x_data is None or len(x_data) < 2:
+            continue
+        x_arr = np.asarray(x_data, dtype=float)
+        y_arr = np.asarray(y_data, dtype=float)
+        valid = np.isfinite(x_arr) & np.isfinite(y_arr)
+        if not np.any(valid):
+            continue
+        x_valid = x_arr[valid]
+        y_valid = y_arr[valid]
+        x_min, x_max = float(np.min(x_valid)), float(np.max(x_valid))
+        if x_val < x_min or x_val > x_max:
+            continue
+        if len(x_valid) > 1 and np.any(np.diff(x_valid) < 0):
+            sort_idx = np.argsort(x_valid)
+            x_valid = x_valid[sort_idx]
+            y_valid = y_valid[sort_idx]
+        f_val = float(np.interp(x_val, x_valid, y_valid))
+        results.append((label, f_val))
+
+    if not results and axes.patches:
+        for p in axes.patches:
+            rx = p.get_x()
+            rw = p.get_width()
+            if rx <= x_val <= rx + rw:
+                results.append(("", float(p.get_height())))
+                break
+
+    primary_val: Optional[float] = None
+    if results:
+        if preferred_label:
+            match = next((val for lbl, val in results if lbl == preferred_label), None)
+            primary_val = match if match is not None else results[0][1]
+        else:
+            primary_val = results[0][1]
+
+    return results, primary_val
 
 
 def moving_average(seq, window=5):
@@ -952,9 +1183,475 @@ def integrate_peak_asym(times, intens, center, tol_minus, tol_plus, smooth_win=5
     return area
 
 
-# ---------------------------
-# Waters Exporter helpers (imported from Waters_Integrator_exporter)
-# ---------------------------
+def execute_peak_integration(
+    csv_folder: str,
+    files: List[Tuple[str, str]],
+    targets: List[Tuple[float, float, float]],
+    status_cb=None,
+    token: Optional["CancellationToken"] = None,
+) -> Tuple[str, int, int]:
+    """
+    Execute batch asymmetric peak integration across a list of chromatogram CSVs.
+    Returns (output_path, processed_files_count, total_rows_count).
+    Supports status callbacks and atomic cancellation via CancellationToken.
+    """
+    total_files = len(files)
+    headers = ["Sample"] + [f"{center:.3f} min" for center, _, _ in targets]
+    rows = []
+    processed = 0
+
+    for idx, (sample_name, path) in enumerate(files):
+        if token and token.is_cancelled():
+            console_log(f"Peak integration aborted by user after {processed} sample(s).", category="UI-INTEGRATE", level="WARN")
+            raise InterruptedError("Peak integration aborted by user.")
+
+        if status_cb:
+            try:
+                status_cb(sample_name, idx + 1, total_files)
+            except TypeError:
+                status_cb(f"[{idx+1}/{total_files}] {sample_name}")
+
+        try:
+            channels = read_chrom_csv_channels(path)
+            if not channels:
+                raise ValueError("Empty or invalid chromatogram")
+            for channel_name, times, intensities in channels:
+                areas = [
+                    integrate_peak_asym(times, intensities, center, tol_minus, tol_plus, smooth_win=5)
+                    for center, tol_minus, tol_plus in targets
+                ]
+                name = sample_name
+                if len(channels) > 1:
+                    name = f"{sample_name}_{channel_name.replace(' ', '')}"
+                area_strs = [f"{area:.6g}" for area in areas]
+                rows.append({"Sample": name, **{header: val for header, val in zip(headers[1:], area_strs)}})
+                area_log = ", ".join(f"{c:.3f}m={a:.4g}" for (c, _, _), a in zip(targets, areas))
+                console_log(f"Integrated '{name}': {area_log}", category="UI-INTEGRATE")
+            processed += 1
+        except Exception as exc:
+            console_log(f"Integration error for '{sample_name}': {exc}", category="UI-INTEGRATE", level="WARN")
+            rows.append({"Sample": sample_name, **{header: "0" for header in headers[1:]}})
+
+    output_path = os.path.join(csv_folder, "00_evaluated_data.csv")
+    with open(output_path, "w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+    console_log(f"Saved evaluation summary to: {output_path} ({len(rows)} sample/channel rows, {len(targets)} targets)", category="UI-INTEGRATE")
+    return output_path, processed, len(rows)
+
+
+# =============================================================================
+# PART 5: EXTERNAL EXPORTER BRIDGES (EXCEL / VEUSZ / LABPLOT)
+# =============================================================================
+
+def export_evaluated_to_excel(
+    csv_or_df,
+    targets: List[Tuple[float, float, float]],
+    output_path: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Export evaluated chromatographic peak integration data to a formatted Excel workbook (.xlsx).
+    Creates a multi-sheet workbook:
+      Sheet 1: 'Integrated Summary' - Styled Excel Named Table with wavelength-specific conditional
+               coloring, auto-filter controls, and embedded bar chart.
+      Sheet 2: 'Substance Mapping' - Helper table linking RT windows with substances (e.g., '13', '203')
+               and dynamic formulas for conversion % and area change calculations.
+      Sheet 3: 'Target Parameters' - Retention times, tolerances, and integration windows.
+      Sheet 4: 'Metadata' - Software version, run timestamp, and statistics.
+    Requires openpyxl.
+    """
+    if not HAS_OPENPYXL:
+        raise ImportError(
+            "The 'openpyxl' package is required for Excel export.\n"
+            "Please run 'pip install openpyxl' to enable this feature."
+        )
+
+    if isinstance(csv_or_df, str):
+        df = pd.read_csv(csv_or_df)
+    else:
+        df = csv_or_df.copy()
+
+    # If df has 'Sample' and not 'Wavelength', insert extracted Wavelength column
+    has_sample = "Sample" in df.columns
+    if has_sample and "Wavelength" not in df.columns:
+        def _extract_wl(s: str) -> str:
+            m = re.findall(r"(\d{2,4})[\s_]*nm", str(s), re.IGNORECASE)
+            return f"{m[-1]} nm" if m else "General"
+        wls = [_extract_wl(v) for v in df["Sample"]]
+        df.insert(1, "Wavelength", wls)
+
+    # Detect candidate substance identifiers from Sample names
+    cand_subs: List[str] = []
+    if has_sample:
+        for s in df["Sample"]:
+            norm = str(s).replace("\\", "/")
+            parts = norm.split("/")
+            if len(parts) > 1 and parts[0].strip() and parts[0].strip() not in cand_subs:
+                cand_subs.append(parts[0].strip())
+            base = os.path.basename(norm)
+            for num in re.findall(r"(?:^|[_\W])(\d{1,4})(?:[_\W]|$)", base):
+                if len(num) == 4 and (num.startswith("19") or num.startswith("20")):
+                    continue
+                if num in {"210", "214", "220", "230", "240", "254", "260", "270", "280", "290", "300"}:
+                    continue
+                if num not in cand_subs:
+                    cand_subs.append(num)
+
+    wb = openpyxl.Workbook()
+
+    # --- Sheet 1: Integrated Summary ---
+    ws1 = wb.active
+    ws1.title = "Integrated Summary"
+    ws1.views.sheetView[0].showGridLines = True
+
+    # Title Banner
+    ws1["A1"] = "Waters MassLynx - Peak Integration Summary"
+    ws1["A1"].font = XlsxFont(name="Calibri", size=14, bold=True, color="207567")
+
+    subtitle = f"Exported: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Total Samples: {len(df)} | Targets: {len(targets)}"
+    ws1["A2"] = subtitle
+    ws1["A2"].font = XlsxFont(name="Calibri", size=10, italic=True, color="555555")
+
+    # Curated palette for wavelength conditional coloring
+    PALETTE_PRESETS = {
+        "210 nm": {"fill": "E0F2FE", "text": "0369A1", "tint": "F0F9FF"},
+        "214 nm": {"fill": "E0E7FF", "text": "3730A3", "tint": "EEF2FF"},
+        "220 nm": {"fill": "EDE9FE", "text": "5B21B6", "tint": "F5F3FF"},
+        "230 nm": {"fill": "F3E8FF", "text": "6B21A8", "tint": "FAF5FF"},
+        "240 nm": {"fill": "DBEAFE", "text": "1E40AF", "tint": "EFF6FF"},
+        "254 nm": {"fill": "D1FAE5", "text": "065F46", "tint": "ECFDF5"},
+        "260 nm": {"fill": "CCFBF1", "text": "0F766E", "tint": "F0FDFA"},
+        "270 nm": {"fill": "FCE7F3", "text": "9D174D", "tint": "FDF2F8"},
+        "280 nm": {"fill": "FEF3C7", "text": "92400E", "tint": "FFFBEB"},
+        "290 nm": {"fill": "FFEDD5", "text": "9A3412", "tint": "FFF7ED"},
+        "300 nm": {"fill": "FEE2E2", "text": "991B1B", "tint": "FEF2F2"},
+    }
+    FALLBACK_CYCLES = [
+        {"fill": "E0F2FE", "text": "0369A1", "tint": "F0F9FF"},
+        {"fill": "FCE7F3", "text": "9D174D", "tint": "FDF2F8"},
+        {"fill": "D1FAE5", "text": "065F46", "tint": "ECFDF5"},
+        {"fill": "FEF3C7", "text": "92400E", "tint": "FFFBEB"},
+        {"fill": "EDE9FE", "text": "5B21B6", "tint": "F5F3FF"},
+        {"fill": "FFEDD5", "text": "9A3412", "tint": "FFF7ED"},
+        {"fill": "CCFBF1", "text": "0F766E", "tint": "F0FDFA"},
+    ]
+
+    unique_wls = list(dict.fromkeys(df["Wavelength"])) if "Wavelength" in df.columns else []
+    wl_colors = {}
+    for idx, wl in enumerate(unique_wls):
+        if wl in PALETTE_PRESETS:
+            wl_colors[wl] = PALETTE_PRESETS[wl]
+        else:
+            wl_colors[wl] = FALLBACK_CYCLES[idx % len(FALLBACK_CYCLES)]
+
+    # Table Header (Row 4)
+    header_fill = PatternFill(start_color="207567", end_color="207567", fill_type="solid")
+    header_font = XlsxFont(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    headers = list(df.columns)
+    for col_idx, header_text in enumerate(headers, start=1):
+        cell = ws1.cell(row=4, column=col_idx, value=header_text)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+
+    # Table Data (Rows 5+) with conditional coloring per wavelength
+    thin_border = Border(
+        left=Side(style="thin", color="E2E8F0"),
+        right=Side(style="thin", color="E2E8F0"),
+        top=Side(style="thin", color="E2E8F0"),
+        bottom=Side(style="thin", color="E2E8F0"),
+    )
+
+    for row_idx, row_data in enumerate(df.itertuples(index=False), start=5):
+        wl_val = getattr(row_data, "Wavelength", None) if hasattr(row_data, "Wavelength") else (row_data[1] if len(row_data) > 1 and "Wavelength" in headers else None)
+        colors = wl_colors.get(wl_val, FALLBACK_CYCLES[0]) if wl_val else {"fill": "F1F5F9", "text": "334155", "tint": "F8FAFC"}
+
+        row_fill = PatternFill(start_color=colors["tint"], end_color=colors["tint"], fill_type="solid")
+        wl_badge_fill = PatternFill(start_color=colors["fill"], end_color=colors["fill"], fill_type="solid")
+
+        for col_idx, val in enumerate(row_data, start=1):
+            cell = ws1.cell(row=row_idx, column=col_idx)
+            header_name = headers[col_idx - 1]
+
+            if header_name == "Wavelength":
+                cell.value = str(val)
+                cell.fill = wl_badge_fill
+                cell.font = XlsxFont(name="Calibri", size=10, bold=True, color=colors["text"])
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif header_name == "Sample":
+                cell.value = str(val)
+                cell.fill = row_fill
+                cell.font = XlsxFont(name="Calibri", size=10)
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+            else:
+                try:
+                    num_val = float(val)
+                    cell.value = num_val
+                    cell.number_format = "0.000000"
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                except (ValueError, TypeError):
+                    cell.value = str(val)
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                cell.fill = row_fill
+                cell.font = XlsxFont(name="Calibri", size=10)
+
+            cell.border = thin_border
+
+    # Freeze panes below header
+    ws1.freeze_panes = "A5"
+
+    # Auto-adjust column widths
+    for col_idx, col_name in enumerate(headers, start=1):
+        col_letter = get_column_letter(col_idx)
+        max_len = max(len(str(col_name)), max((len(str(df.iloc[r, col_idx-1])) for r in range(min(50, len(df)))), default=0))
+        ws1.column_dimensions[col_letter].width = max(14, min(40, max_len + 4))
+
+    # Assign an Excel named Table format for filtering & sorting
+    if len(df) > 0:
+        last_col_letter = get_column_letter(len(headers))
+        last_row = 4 + len(df)
+        data_table = Table(displayName="IntegratedDataTable", ref=f"A4:{last_col_letter}{last_row}")
+        data_table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=False, # preserves wavelength conditional colors
+            showColumnStripes=False,
+        )
+        ws1.add_table(data_table)
+
+    # Add Bar Chart if data exists
+    numeric_start_col = 3 if "Wavelength" in headers else 2
+    if len(df) > 0 and len(headers) >= numeric_start_col:
+        chart = BarChart()
+        chart.type = "col"
+        chart.style = 10
+        chart.title = "Integrated Peak Areas by Sample"
+        chart.y_axis.title = "Area"
+        chart.x_axis.title = "Sample"
+        chart.width = 19
+        chart.height = 11
+
+        data_ref = Reference(ws1, min_col=numeric_start_col, min_row=4, max_col=len(headers), max_row=4 + len(df))
+        cats_ref = Reference(ws1, min_col=1, min_row=5, max_row=4 + len(df))
+        chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
+        chart_col_letter = get_column_letter(len(headers) + 2)
+        ws1.add_chart(chart, f"{chart_col_letter}4")
+
+    # --- Sheet 2: Substance Mapping & Conversion Calculations Helper ---
+    ws2 = wb.create_sheet(title="Substance Mapping")
+    ws2.views.sheetView[0].showGridLines = True
+
+    ws2["A1"] = "Substance Linking & Conversion Calculator"
+    ws2["A1"].font = XlsxFont(name="Calibri", size=14, bold=True, color="207567")
+
+    ws2["A2"] = "Link RT windows to substances (e.g. '13', '203') to compute conversions, area ratios, and reaction progress."
+    ws2["A2"].font = XlsxFont(name="Calibri", size=10, italic=True, color="555555")
+
+    sub_banner = f"Detected Candidate Substances in Run: {', '.join(cand_subs) if cand_subs else 'None detected automatically'}"
+    ws2["A3"] = sub_banner
+    ws2["A3"].font = XlsxFont(name="Calibri", size=10, bold=True, color="334155")
+
+    # Table 1: Substance Mapping Table
+    ws2["A5"] = "Table 1: Substance & Retention Time Mapping"
+    ws2["A5"].font = XlsxFont(name="Calibri", size=12, bold=True, color="207567")
+
+    map_headers = [
+        "Target #",
+        "RT Window",
+        "Substance ID",
+        "Substance Name / Role",
+        "Expected RT (min)",
+        "Tolerance -",
+        "Tolerance +",
+        "Response Factor (RF)",
+        "Summary Column",
+    ]
+    t1_fill = PatternFill(start_color="207567", end_color="207567", fill_type="solid")
+    for c_idx, h_text in enumerate(map_headers, start=1):
+        c = ws2.cell(row=6, column=c_idx, value=h_text)
+        c.fill = t1_fill
+        c.font = XlsxFont(name="Calibri", size=10, bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    num_targets = len(targets)
+    for t_idx, (center, tol_minus, tol_plus) in enumerate(targets, start=1):
+        r_num = 6 + t_idx
+        assigned_sub = cand_subs[t_idx - 1] if (t_idx - 1) < len(cand_subs) else ""
+        default_role = "Starting Material (SM)" if t_idx == 1 else ("Product" if t_idx == 2 else ("Internal Standard (IS)" if t_idx == 3 else "Byproduct"))
+        col_letter = get_column_letter(2 + t_idx) if "Wavelength" in headers else get_column_letter(1 + t_idx)
+
+        row_vals = [
+            f"Target {t_idx}",
+            f"{center:.3f} min",
+            assigned_sub,
+            default_role,
+            center,
+            tol_minus,
+            tol_plus,
+            1.000,
+            f"'Integrated Summary'!{col_letter}",
+        ]
+        for c_idx, val in enumerate(row_vals, start=1):
+            c = ws2.cell(row=r_num, column=c_idx, value=val)
+            c.border = thin_border
+            c.font = XlsxFont(name="Calibri", size=10)
+            if isinstance(val, (int, float)):
+                c.number_format = "0.000"
+                c.alignment = Alignment(horizontal="right")
+            elif c_idx in (1, 2, 3, 9):
+                c.alignment = Alignment(horizontal="center")
+
+    if num_targets > 0:
+        tab_map = Table(displayName="SubstanceMappingTable", ref=f"A6:I{6 + num_targets}")
+        tab_map.tableStyleInfo = TableStyleInfo(name="TableStyleLight1", showRowStripes=True)
+        ws2.add_table(tab_map)
+
+    # Table 2: Conversion & Area Change Calculations
+    calc_start_row = 8 + max(num_targets, 1)
+    ws2[f"A{calc_start_row}"] = "Table 2: Conversion & Area Change Calculations"
+    ws2[f"A{calc_start_row}"].font = XlsxFont(name="Calibri", size=12, bold=True, color="207567")
+
+    ws2[f"A{calc_start_row + 1}"] = "Formulas reference 'Integrated Summary'. You can change the Reactant or Product columns as needed."
+    ws2[f"A{calc_start_row + 1}"].font = XlsxFont(name="Calibri", size=10, italic=True, color="555555")
+
+    calc_hdr_row = calc_start_row + 2
+    calc_headers = [
+        "Sample",
+        "Wavelength",
+        "Reactant / SM Area",
+        "Product Area",
+        "Conversion (%)",
+        "Area Ratio (P/SM)",
+        "Total Peak Area",
+    ]
+    t2_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    for c_idx, h_text in enumerate(calc_headers, start=1):
+        c = ws2.cell(row=calc_hdr_row, column=c_idx, value=h_text)
+        c.fill = t2_fill
+        c.font = XlsxFont(name="Calibri", size=10, bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    has_target_cols = (len(headers) > (2 if "Wavelength" in headers else 1)) and num_targets > 0
+    reactant_col = "C" if "Wavelength" in headers else "B"
+    product_col = ("D" if num_targets >= 2 else "C") if "Wavelength" in headers else ("C" if num_targets >= 2 else "B")
+    last_target_col = get_column_letter(len(headers))
+
+    for i in range(len(df)):
+        r_calc = calc_hdr_row + 1 + i
+        r_src = 5 + i
+
+        c1 = ws2.cell(row=r_calc, column=1, value=f"='Integrated Summary'!A{r_src}")
+        c2 = ws2.cell(row=r_calc, column=2, value=f"='Integrated Summary'!{'B' if 'Wavelength' in headers else 'A'}{r_src}")
+        if has_target_cols:
+            c3 = ws2.cell(row=r_calc, column=3, value=f"='Integrated Summary'!{reactant_col}{r_src}")
+            c4 = ws2.cell(row=r_calc, column=4, value=f"='Integrated Summary'!{product_col}{r_src}")
+            c5 = ws2.cell(row=r_calc, column=5, value=f"=IF((C{r_calc}+D{r_calc})>0, (D{r_calc}/(C{r_calc}+D{r_calc}))*100, 0)")
+            c6 = ws2.cell(row=r_calc, column=6, value=f"=IF(C{r_calc}>0, D{r_calc}/C{r_calc}, 0)")
+            c7 = ws2.cell(row=r_calc, column=7, value=f"=SUM('Integrated Summary'!{reactant_col}{r_src}:{last_target_col}{r_src})")
+        else:
+            c3 = ws2.cell(row=r_calc, column=3, value=0.0)
+            c4 = ws2.cell(row=r_calc, column=4, value=0.0)
+            c5 = ws2.cell(row=r_calc, column=5, value=0.0)
+            c6 = ws2.cell(row=r_calc, column=6, value=0.0)
+            c7 = ws2.cell(row=r_calc, column=7, value=0.0)
+
+        for c_idx, cell in enumerate((c1, c2, c3, c4, c5, c6, c7), start=1):
+            cell.border = thin_border
+            cell.font = XlsxFont(name="Calibri", size=10)
+            if c_idx in (1, 2):
+                cell.alignment = Alignment(horizontal="left")
+            elif c_idx in (3, 4, 7):
+                cell.number_format = "0.000000"
+                cell.alignment = Alignment(horizontal="right")
+            elif c_idx == 5:
+                cell.number_format = "0.00"
+                cell.alignment = Alignment(horizontal="right")
+            elif c_idx == 6:
+                cell.number_format = "0.0000"
+                cell.alignment = Alignment(horizontal="right")
+
+    if len(df) > 0:
+        tab_calc = Table(displayName="ConversionCalculationTable", ref=f"A{calc_hdr_row}:G{calc_hdr_row + len(df)}")
+        tab_calc.tableStyleInfo = TableStyleInfo(name="TableStyleLight1", showRowStripes=True)
+        ws2.add_table(tab_calc)
+
+    ws2_widths = {1: 30, 2: 18, 3: 20, 4: 24, 5: 18, 6: 18, 7: 18, 8: 20, 9: 24}
+    for c_idx, w in ws2_widths.items():
+        col_letter = get_column_letter(c_idx)
+        ws2.column_dimensions[col_letter].width = w
+
+    # --- Sheet 3: Target Parameters ---
+    ws3 = wb.create_sheet(title="Target Parameters")
+    ws3.views.sheetView[0].showGridLines = True
+    ws3["A1"] = "Integration Target Windows"
+    ws3["A1"].font = XlsxFont(name="Calibri", size=13, bold=True, color="334155")
+
+    target_headers = ["Target #", "Center RT (min)", "Tolerance - (min)", "Tolerance + (min)", "Window Start (min)", "Window End (min)"]
+    t_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    for c_idx, h_text in enumerate(target_headers, start=1):
+        c = ws3.cell(row=3, column=c_idx, value=h_text)
+        c.fill = t_fill
+        c.font = XlsxFont(name="Calibri", size=10, bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center")
+
+    for t_idx, (center, tol_minus, tol_plus) in enumerate(targets, start=1):
+        r_num = 3 + t_idx
+        row_vals = [
+            f"Target {t_idx}",
+            center,
+            tol_minus,
+            tol_plus,
+            center - tol_minus,
+            center + tol_plus,
+        ]
+        for c_idx, val in enumerate(row_vals, start=1):
+            c = ws3.cell(row=r_num, column=c_idx, value=val)
+            c.border = thin_border
+            c.font = XlsxFont(name="Calibri", size=10)
+            if isinstance(val, (int, float)):
+                c.number_format = "0.000"
+                c.alignment = Alignment(horizontal="right")
+
+    for col in ws3.columns:
+        col_letter = get_column_letter(col[0].column)
+        ws3.column_dimensions[col_letter].width = 20
+
+    # --- Sheet 4: Metadata & Diagnostics ---
+    ws4 = wb.create_sheet(title="Metadata")
+    ws4.views.sheetView[0].showGridLines = True
+    ws4["A1"] = "Experiment & Export Metadata"
+    ws4["A1"].font = XlsxFont(name="Calibri", size=13, bold=True, color="334155")
+
+    meta_items = [
+        ("Application", "Waters MassLynx Integrator"),
+        ("Export Timestamp", datetime.datetime.now().isoformat()),
+        ("Samples Evaluated", len(df)),
+        ("Targets Configured", len(targets)),
+        ("Target Summary", ", ".join(f"{c:.3f}m (-{tm:.3f},+{tp:.3f})" for c, tm, tp in targets)),
+    ]
+    if metadata:
+        meta_items.extend(metadata.items())
+
+    for m_idx, (k, v) in enumerate(meta_items, start=3):
+        k_cell = ws4.cell(row=m_idx, column=1, value=str(k))
+        k_cell.font = XlsxFont(name="Calibri", size=10, bold=True, color="334155")
+        v_cell = ws4.cell(row=m_idx, column=2, value=str(v))
+        v_cell.font = XlsxFont(name="Calibri", size=10)
+
+    ws4.column_dimensions["A"].width = 24
+    ws4.column_dimensions["B"].width = 60
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    wb.save(output_path)
+    console_log(f"Exported evaluation workbook to Excel: {output_path} ({len(df)} rows, {len(targets)} targets)", category="UI-EXPORT")
+    return output_path
+
 
 try:
     from Waters_Integrator_exporter import (
@@ -984,11 +1681,160 @@ except ImportError:
         pass
 
 
+# =============================================================================
+# PART 6: MULTI-THREADING ENGINE & ASYNCHRONOUS WORKERS (QThreadPool / QRunnable)
+# =============================================================================
+
+class CancellationToken:
+    """Thread-safe cancellation token / atomic abort flag for asynchronous tasks."""
+    def __init__(self):
+        self._event = threading.Event()
+
+    def cancel(self):
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def reset(self):
+        self._event.clear()
 
 
-# ---------------------------
-# GUI
-# ---------------------------
+class WorkerSignals(QObject):
+    """
+    Standardized Qt signal carrier for QRunnable workers.
+    Enables safe cross-thread queued signal-slot dispatching to the main GUI thread.
+    """
+    progress = Signal(int, int, str)        # current, total, status_text/sample_name
+    log = Signal(str, str, str)             # message, category, level
+    error = Signal(str)                     # error description
+    finished = Signal(object)               # result payload dict
+    cancelled = Signal()                    # triggered on graceful abort
+
+
+class ExtractionWorker(QRunnable):
+    """
+    Background worker for parsing and extracting MassLynx .raw directories.
+    Runs on QThreadPool without blocking the GUI event loop.
+    """
+    def __init__(
+        self,
+        root: str,
+        prec: int = 0,
+        merge_wavelengths: Optional[List[str]] = None,
+        group_rules: Optional[List[tuple]] = None,
+        match_mode: str = "Regex",
+        run_items: Optional[List[tuple]] = None,
+        token: Optional[CancellationToken] = None,
+    ):
+        super().__init__()
+        self.root = root
+        self.prec = prec
+        self.merge_wavelengths = merge_wavelengths
+        self.group_rules = group_rules
+        self.match_mode = match_mode
+        self.run_items = run_items
+        self.token = token or CancellationToken()
+        self.signals = WorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            chrom_dir = extract_masslynx_folder(
+                root=self.root,
+                status_cb=lambda name, cur, tot: self.signals.progress.emit(cur, tot, name),
+                prec=self.prec,
+                merge_wavelengths=self.merge_wavelengths,
+                group_rules=self.group_rules,
+                match_mode=self.match_mode,
+                run_items=self.run_items,
+                token=self.token,
+            )
+            if self.token.is_cancelled():
+                self.signals.cancelled.emit()
+            else:
+                self.signals.finished.emit({"chrom_dir": chrom_dir})
+        except InterruptedError:
+            self.signals.cancelled.emit()
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+
+
+class IntegrationWorker(QRunnable):
+    """
+    Background worker for batch peak integration across CSV files.
+    Runs on QThreadPool without freezing the GUI.
+    """
+    def __init__(
+        self,
+        csv_folder: str,
+        files: List[Tuple[str, str]],
+        targets: List[Tuple[float, float, float]],
+        token: Optional[CancellationToken] = None,
+    ):
+        super().__init__()
+        self.csv_folder = csv_folder
+        self.files = files
+        self.targets = targets
+        self.token = token or CancellationToken()
+        self.signals = WorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            output_path, processed, row_count = execute_peak_integration(
+                csv_folder=self.csv_folder,
+                files=self.files,
+                targets=self.targets,
+                status_cb=lambda name, cur, tot: self.signals.progress.emit(cur, tot, name),
+                token=self.token,
+            )
+            if self.token.is_cancelled():
+                self.signals.cancelled.emit()
+            else:
+                self.signals.finished.emit({
+                    "output_path": output_path,
+                    "processed": processed,
+                    "total": len(self.files),
+                    "row_count": row_count,
+                })
+        except InterruptedError:
+            self.signals.cancelled.emit()
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+
+
+class CsvLoaderWorker(QRunnable):
+    """
+    Lightweight background worker for reading CSV datasets asynchronously.
+    Prevents UI stutter when inspecting large chromatographic or m/z files.
+    """
+    def __init__(self, path: str, request_id: int, row_index: int):
+        super().__init__()
+        self.path = path
+        self.request_id = request_id
+        self.row_index = row_index
+        self.signals = WorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            frame = pd.read_csv(self.path)
+            self.signals.finished.emit({
+                "frame": frame,
+                "path": self.path,
+                "request_id": self.request_id,
+                "row_index": self.row_index,
+            })
+        except Exception as exc:
+            self.signals.error.emit(f"{exc}:::path:::{self.path}:::req:::{self.request_id}")
+
+
+# =============================================================================
+# PART 7: PYQT/PYSIDE UI COMPONENTS & MAIN WORKSPACE WINDOW
+# =============================================================================
+
+# --- 7.1 Console Stream & Terminal Interceptor ---
 class QtConsoleStream(QObject):
     text_written = Signal(str, str)
 
@@ -1217,7 +2063,40 @@ class MassLynxWindow(QMainWindow):
         self.figure = Figure(figsize=(8, 4), dpi=100, constrained_layout=True)
         self.axes = self.figure.add_subplot(111)
 
+        # Asynchronous multi-threading thread pool and task tokens
+        self.thread_pool = QThreadPool.globalInstance()
+        self.active_cancellation_token: Optional[CancellationToken] = None
+        self._csv_load_request_id: int = 0
+
+        # Performance mode and canvas throttling debouncer
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(150)
+        self._resize_timer.timeout.connect(self._on_debounced_resize)
+
+        # Plot cursor guidelines, tracker markers and console buffer
+        self._plot_crosshair = None
+        self._plot_marker = None
+        self._integration_crosshair = None
+        self._integration_marker = None
+        self._console_history: List[Tuple[str, str]] = []
+
         self._build_ui()
+
+    def _on_debounced_resize(self):
+        """Redraw canvases after resizing finishes to prevent UI stutter."""
+        if hasattr(self, "plot_canvas"):
+            self.plot_canvas.draw_idle()
+        if hasattr(self, "integration_canvas") and hasattr(self, "integration_preview_panel") and self.integration_preview_panel.isVisible():
+            self.integration_canvas.draw_idle()
+
+    def closeEvent(self, event):
+        """Ensure active background workers are cancelled gracefully before closing."""
+        if self.active_cancellation_token and not self.active_cancellation_token.is_cancelled():
+            console_log("Cancelling background tasks on window close.", category="SHUTDOWN")
+            self.active_cancellation_token.cancel()
+            self.thread_pool.waitForDone(500)
+        super().closeEvent(event)
         console_log(
             f"MassLynx workspace initialized | Config: {self.settings_json_path} "
             f"({len(self.templates)} templates, {len(self.recent_targets)} recent targets loaded)",
@@ -1279,6 +2158,29 @@ class MassLynxWindow(QMainWindow):
         scroll.setWidget(content)
         self.setCentralWidget(scroll)
         self._build_console_drawer()
+
+        # Status bar progress and cancellation controls
+        self.status_progress = QProgressBar()
+        self.status_progress.setRange(0, 100)
+        self.status_progress.setValue(0)
+        self.status_progress.setTextVisible(True)
+        self.status_progress.setFixedWidth(160)
+        self.status_progress.setFixedHeight(18)
+        self.status_progress.setVisible(False)
+
+        self.status_abort_btn = QPushButton("Abort")
+        self.status_abort_btn.setFixedHeight(22)
+        self.status_abort_btn.setStyleSheet(
+            "QPushButton { background: #d9534f; color: white; font-weight: bold; font-size: 11px; padding: 2px 10px; border-radius: 4px; }"
+            "QPushButton:hover { background: #c9302c; }"
+            "QPushButton:disabled { background: #888888; color: #cccccc; }"
+        )
+        self.status_abort_btn.setVisible(False)
+        self.status_abort_btn.clicked.connect(self.abort_active_task)
+
+        self.statusBar().addPermanentWidget(self.status_progress)
+        self.statusBar().addPermanentWidget(self.status_abort_btn)
+
         self.statusBar().showMessage("Ready")
         self.theme_style_combo.currentIndexChanged.connect(self.apply_theme)
         self.theme_mode_combo.currentIndexChanged.connect(self.apply_theme)
@@ -1389,6 +2291,8 @@ class MassLynxWindow(QMainWindow):
 
         if hasattr(self, "console_highlighter"):
             self.console_highlighter.set_dark_mode(system_dark)
+        if hasattr(self, "rules_highlighter"):
+            self.rules_highlighter.set_dark_mode(system_dark)
 
         if hasattr(self, "console_text"):
             console_bg = "#161719" if system_dark else "#fdfdfd"
@@ -1414,6 +2318,8 @@ class MassLynxWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "_resize_timer"):
+            self._resize_timer.start()
         narrow = self.width() < 900
         if narrow == self._responsive_narrow:
             return
@@ -1507,6 +2413,8 @@ class MassLynxWindow(QMainWindow):
         )
         self.group_rules_edit.setMaximumHeight(88)
         self.group_rules_edit.setCurrentFont(["Cascadia Code NF","Consolas", "monospace"])
+        is_dark = (self.settings.value("theme/mode", "Dark") != "Light")
+        self.rules_highlighter = RegexSyntaxHighlighter(self.group_rules_edit.document(), is_dark=is_dark)
         form.addWidget(self.group_rules_label, 2, 0, Qt.AlignmentFlag.AlignTop)
         form.addWidget(self.group_rules_edit, 2, 1, 1, 2)
 
@@ -1556,9 +2464,9 @@ class MassLynxWindow(QMainWindow):
         self.wildcard_radio.toggled.connect(self._update_auto_destinations)
         self.regex_radio.toggled.connect(self._update_auto_destinations)
 
-        extract_button = QPushButton("Extract files")
-        extract_button.clicked.connect(self.extract_clicked)
-        section.body_layout.addWidget(extract_button, 0, Qt.AlignmentFlag.AlignRight)
+        self.extract_button = QPushButton("Extract files")
+        self.extract_button.clicked.connect(self.extract_clicked)
+        section.body_layout.addWidget(self.extract_button, 0, Qt.AlignmentFlag.AlignRight)
 
     def _build_integration_section(self, parent_layout):
         section = CollapsibleSection("02  Peak integration", expanded=False)
@@ -1650,11 +2558,16 @@ class MassLynxWindow(QMainWindow):
         delete_target = QPushButton("Delete selected")
         delete_target.setObjectName("secondaryButton")
         delete_target.clicked.connect(self.delete_selected_targets)
-        run_integration = QPushButton("Integrate CSVs")
-        run_integration.clicked.connect(self.integrate_clicked)
+        self.export_excel_button = QPushButton("Export to Excel")
+        self.export_excel_button.setObjectName("secondaryButton")
+        self.export_excel_button.setToolTip("Export evaluated peak integration data to a formatted Excel workbook (.xlsx)")
+        self.export_excel_button.clicked.connect(self.export_integration_excel_clicked)
+        self.run_integration_button = QPushButton("Integrate CSVs")
+        self.run_integration_button.clicked.connect(self.integrate_clicked)
         target_actions.addWidget(delete_target)
         target_actions.addStretch(1)
-        target_actions.addWidget(run_integration)
+        target_actions.addWidget(self.export_excel_button)
+        target_actions.addWidget(self.run_integration_button)
         target_row.addLayout(target_actions)
         target_layout.addLayout(target_row)
         splitter.addWidget(target_panel)
@@ -1668,17 +2581,29 @@ class MassLynxWindow(QMainWindow):
         self.integration_figure = Figure(figsize=(5, 3.5), dpi=100, constrained_layout=True)
         self.integration_axes = self.integration_figure.add_subplot(111)
         self.integration_canvas = FigureCanvasQTAgg(self.integration_figure)
+        self.integration_hud_label = QLabel("RT: -- | Signal: --")
+        self.integration_hud_label.setStyleSheet(
+            "background: palette(midlight); border-radius: 3px; padding: 2px 8px; "
+            "font-family: Consolas, monospace; font-size: 11px;"
+        )
         self.integration_toolbar = NavigationToolbar2QT(self.integration_canvas, self.integration_preview_panel)
         self.integration_toolbar.setVisible(False)
         self.integration_plot_controls.toggled.connect(self.integration_toolbar.setVisible)
+        integration_plot_layout.addWidget(self.integration_hud_label)
         integration_plot_layout.addWidget(self.integration_toolbar)
         integration_plot_layout.addWidget(self.integration_canvas, 1)
+
+        self.integration_canvas.mpl_connect("motion_notify_event", self._on_integration_canvas_hover)
+        self.integration_canvas.mpl_connect("axes_leave_event", self._on_integration_canvas_leave)
+        self.integration_canvas.mpl_connect("button_press_event", self._on_integration_canvas_click)
+
         self.integration_preview_status = QLabel("Choose a sample to preview its integration window.")
         self.integration_preview_status.setWordWrap(True)
         integration_plot_layout.addWidget(self.integration_preview_status)
         self.integration_preview_panel.setMinimumWidth(260)
         self.integration_preview_panel.setVisible(False)
         splitter.addWidget(self.integration_preview_panel)
+        splitter.splitterMoved.connect(lambda *_: self._resize_timer.start())
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
         splitter.setHandleWidth(8)
@@ -1799,7 +2724,12 @@ class MassLynxWindow(QMainWindow):
             self.integration_axes.bar(times, intensities, width=min(spacing * 0.8, 0.8), color="#207567")
             self.integration_axes.grid(True, axis="y", alpha=0.3)
         else:
-            self.integration_axes.plot(times, intensities, color="#207567", linewidth=1.5)
+            use_decimation = getattr(self, "perf_mode_checkbox", None) and self.perf_mode_checkbox.isChecked()
+            if use_decimation and len(times) > 10000:
+                times_draw, intensities_draw = decimate_trace(times, intensities, max_points=10000)
+            else:
+                times_draw, intensities_draw = times, intensities
+            self.integration_axes.plot(times_draw, intensities_draw, color="#207567", linewidth=1.5)
         for center, tol_minus, tol_plus in self.targets:
             self.integration_axes.axvspan(
                 center - tol_minus,
@@ -2041,6 +2971,11 @@ class MassLynxWindow(QMainWindow):
         controls_layout.addRow("Overlay", self.plot_all_checkbox)
         self.plot_controls_checkbox = QCheckBox("Plot controls")
         controls_layout.addRow(self.plot_controls_checkbox)
+        self.perf_mode_checkbox = QCheckBox("Performance mode")
+        self.perf_mode_checkbox.setChecked(self.settings.value("plot/perf_mode", True, type=bool))
+        self.perf_mode_checkbox.setToolTip("Downsamples preview traces exceeding 10,000 points using peak-preserving decimation for smoother interaction.")
+        self.perf_mode_checkbox.toggled.connect(self._on_perf_mode_toggled)
+        controls_layout.addRow(self.perf_mode_checkbox)
         reload_button = QPushButton("Reload CSV list")
         reload_button.setObjectName("secondaryButton")
         reload_button.clicked.connect(self.refresh_plot_files)
@@ -2048,6 +2983,11 @@ class MassLynxWindow(QMainWindow):
         export_button = QPushButton("Export plot")
         export_button.clicked.connect(self.export_plot_clicked)
         controls_layout.addRow(export_button)
+        self.plot_export_excel_btn = QPushButton("Export table to Excel")
+        self.plot_export_excel_btn.setObjectName("secondaryButton")
+        self.plot_export_excel_btn.setToolTip("Export the loaded table to a styled Excel workbook (.xlsx)")
+        self.plot_export_excel_btn.clicked.connect(self.export_plot_table_excel_clicked)
+        controls_layout.addRow(self.plot_export_excel_btn)
         self.plot_export_dpi = QSpinBox()
         self.plot_export_dpi.setRange(72, 2400)
         self.plot_export_dpi.setSingleStep(100)
@@ -2074,11 +3014,22 @@ class MassLynxWindow(QMainWindow):
         self.plot_canvas.minimumSizeHint = lambda: QSize(50, 50)
         self.plot_canvas.sizeHint = lambda: QSize(350, 200)
 
+        self.plot_hud_label = QLabel("RT: -- | Signal: --")
+        self.plot_hud_label.setStyleSheet(
+            "background: palette(midlight); border-radius: 3px; padding: 2px 8px; "
+            "font-family: Consolas, monospace; font-size: 11px;"
+        )
         self.plot_toolbar = NavigationToolbar2QT(self.plot_canvas, plot_panel)
         self.plot_toolbar.setVisible(False)
         self.plot_controls_checkbox.toggled.connect(self.plot_toolbar.setVisible)
+        plot_layout.addWidget(self.plot_hud_label)
         plot_layout.addWidget(self.plot_toolbar)
         plot_layout.addWidget(self.plot_canvas)
+
+        self.plot_canvas.mpl_connect("motion_notify_event", self._on_plot_canvas_hover)
+        self.plot_canvas.mpl_connect("axes_leave_event", self._on_plot_canvas_leave)
+        self.plot_canvas.mpl_connect("button_press_event", self._on_plot_canvas_click)
+
         self.preview_tabs.addTab(plot_panel, "Plot preview")
 
         table_panel = QWidget()
@@ -2102,6 +3053,7 @@ class MassLynxWindow(QMainWindow):
 
         splitter.addWidget(controls)
         splitter.addWidget(self.preview_tabs)
+        splitter.splitterMoved.connect(lambda *_: self._resize_timer.start())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setHandleWidth(12)
@@ -2191,15 +3143,20 @@ class MassLynxWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select folder with CSV datasets")
         if folder:
             self.labplot_folder_edit.setText(folder)
-            if not self.labplot_output_edit.text().strip():
-                self.labplot_output_edit.setText(os.path.join(folder, "Waters_Veusz_Project.vsz"))
+            folder_name = os.path.basename(os.path.normpath(folder)) or "export"
+            curr = self.labplot_output_edit.text().strip()
+            if not curr or "waters_veusz_project" in curr.lower() or "waters_labplot_project" in curr.lower() or curr.endswith("_export.vsz"):
+                self.labplot_output_edit.setText(os.path.join(folder, f"Waters_{folder_name}_export.vsz"))
 
     def browse_labplot_output(self):
         filters = "Veusz Project (*.vsz);;LabPlot Project (Deprecated) (*.lml);;All Files (*.*)"
+        folder = self.labplot_folder_edit.text().strip() or self.csv_folder_edit.text().strip()
+        folder_name = os.path.basename(os.path.normpath(folder)) if folder else "export"
+        default_file = self.labplot_output_edit.text().strip() or os.path.join(folder or ".", f"Waters_{folder_name}_export.vsz")
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Select project output path",
-            self.labplot_output_edit.text().strip() or "Waters_Veusz_Project.vsz",
+            default_file,
             filters,
         )
         if filename:
@@ -2218,8 +3175,9 @@ class MassLynxWindow(QMainWindow):
             return
 
         output_path = self.labplot_output_edit.text().strip()
+        folder_name = os.path.basename(os.path.normpath(csv_folder)) or "export"
         if not output_path or output_path.casefold().endswith(".vsz"):
-            base_name = os.path.splitext(output_path)[0] if output_path else "Waters_LabPlot_Project"
+            base_name = os.path.splitext(output_path)[0] if output_path else f"Waters_{folder_name}_export"
             output_path = (os.path.join(csv_folder, f"{os.path.basename(base_name)}.lml")
                            if not os.path.isabs(base_name) else f"{base_name}.lml")
             self.labplot_output_edit.setText(output_path)
@@ -2266,12 +3224,10 @@ class MassLynxWindow(QMainWindow):
             return
 
         output_path = self.labplot_output_edit.text().strip()
-        if not output_path or output_path.casefold().endswith((".lml", ".lml.gz", ".py")):
-            base_name = os.path.splitext(output_path)[0] if output_path else "Waters_Veusz_Project"
-            if base_name.casefold().endswith(".lml"):
-                base_name = base_name[:-4]
-            output_path = (os.path.join(csv_folder, f"{os.path.basename(base_name)}.vsz")
-                           if not os.path.isabs(base_name) else f"{base_name}.vsz")
+        folder_name = os.path.basename(os.path.normpath(csv_folder)) or "export"
+        default_name = f"Waters_{folder_name}_export.vsz"
+        if not output_path or output_path.casefold().endswith((".lml", ".lml.gz", ".py")) or "waters_veusz_project" in output_path.lower() or "waters_labplot_project" in output_path.lower():
+            output_path = os.path.join(csv_folder, default_name)
             self.labplot_output_edit.setText(output_path)
 
         add_plots = self.labplot_add_plots_checkbox.isChecked()
@@ -2374,6 +3330,12 @@ class MassLynxWindow(QMainWindow):
 
         toolbar_layout.addStretch(1)
 
+        self.console_level_combo = QComboBox()
+        self.console_level_combo.addItems(["All messages", "INFO and above", "Warnings & errors", "Errors only"])
+        self.console_level_combo.setToolTip("Filter console log entries by severity")
+        self.console_level_combo.currentIndexChanged.connect(self._refilter_console_lines)
+        toolbar_layout.addWidget(self.console_level_combo)
+
         self.console_autoscroll_checkbox = QCheckBox("Auto-scroll")
         self.console_autoscroll_checkbox.setChecked(True)
         toolbar_layout.addWidget(self.console_autoscroll_checkbox)
@@ -2444,10 +3406,40 @@ class MassLynxWindow(QMainWindow):
             return
         self._append_console_output(text, stream_type)
 
+    def _matches_console_filter(self, text: str, stream_type: str, filter_mode: int) -> bool:
+        if filter_mode == 0:
+            return True
+        upper = text.upper()
+        if filter_mode == 1:
+            return not ("[DEBUG]" in upper)
+        elif filter_mode == 2:
+            return any(tag in upper for tag in ("[WARN", "[ERROR", "[CRITICAL")) or stream_type == "stderr"
+        elif filter_mode == 3:
+            return any(tag in upper for tag in ("[ERROR", "[CRITICAL", "TRACEBACK")) or stream_type == "stderr"
+        return True
+
     def _append_console_output(self, text: str, stream_type: str = "stdout"):
-        self.console_text.moveCursor(QTextCursor.MoveOperation.End)
-        self.console_text.insertPlainText(text)
-        self._msg_count += text.count("\n") or 1
+        self._console_history.append((text, stream_type))
+        if len(self._console_history) > 6000:
+            self._console_history = self._console_history[-5000:]
+
+        filter_idx = self.console_level_combo.currentIndex() if hasattr(self, "console_level_combo") else 0
+        if self._matches_console_filter(text, stream_type, filter_idx):
+            self.console_text.moveCursor(QTextCursor.MoveOperation.End)
+            self.console_text.insertPlainText(text)
+            self._msg_count += text.count("\n") or 1
+            self.console_count_label.setText(f"{self._msg_count} lines")
+            if self.console_autoscroll_checkbox.isChecked():
+                self.console_text.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _refilter_console_lines(self):
+        filter_idx = self.console_level_combo.currentIndex()
+        self.console_text.clear()
+        self._msg_count = 0
+        for text, stream_type in self._console_history:
+            if self._matches_console_filter(text, stream_type, filter_idx):
+                self.console_text.insertPlainText(text)
+                self._msg_count += text.count("\n") or 1
         self.console_count_label.setText(f"{self._msg_count} lines")
         if self.console_autoscroll_checkbox.isChecked():
             self.console_text.moveCursor(QTextCursor.MoveOperation.End)
@@ -2458,6 +3450,7 @@ class MassLynxWindow(QMainWindow):
         self._append_console_output(formatted, level.lower())
 
     def _clear_console(self):
+        self._console_history.clear()
         self.console_text.clear()
         self._msg_count = 0
         self.console_count_label.setText("0 lines")
@@ -2700,46 +3693,82 @@ class MassLynxWindow(QMainWindow):
             f"Match mode: {self.current_match_mode()} | Rules: {len(rules)} | Merge wavelengths: {merge_wavelengths or 'none'}",
             category="UI-EXTRACT",
         )
-        self.statusBar().showMessage("Extracting RAW files...")
-        QApplication.processEvents()
-        try:
-            chrom_dir = extract_masslynx_folder(
-                root,
-                status_cb=lambda message: self.statusBar().showMessage(message),
-                prec=0,
-                merge_wavelengths=merge_wavelengths,
-                group_rules=rules,
-                match_mode=self.current_match_mode(),
-                run_items=run_items,
-            )
-        except Exception as exc:
-            console_log(f"Extraction failed: {exc}", category="UI-EXTRACT", level="ERROR")
-            QMessageBox.critical(self, "Extraction failed", str(exc))
-            self.statusBar().showMessage("Extraction failed")
-            return
-        self.csv_folder_edit.setText(chrom_dir)
-        self.plot_folder_edit.setText(chrom_dir)
-        self.labplot_folder_edit.setText(chrom_dir)
-        self.labplot_output_edit.setText(os.path.join(chrom_dir, "Waters_LabPlot_Project.lml"))
-        self.refresh_plot_files()
-        self.refresh_integration_preview_files()
+        self.statusBar().showMessage(f"Starting RAW extraction (0/{len(run_items)})...")
+
+        # Configure worker & UI controls
+        self.extract_button.setEnabled(False)
+        self.run_integration_button.setEnabled(False)
+        self.status_progress.setRange(0, len(run_items))
+        self.status_progress.setValue(0)
+        self.status_progress.setVisible(True)
+        self.status_abort_btn.setEnabled(True)
+        self.status_abort_btn.setText("Abort")
+        self.status_abort_btn.setVisible(True)
+
+        self.active_cancellation_token = CancellationToken()
+        worker = ExtractionWorker(
+            root=root,
+            prec=0,
+            merge_wavelengths=merge_wavelengths,
+            group_rules=rules,
+            match_mode=self.current_match_mode(),
+            run_items=run_items,
+            token=self.active_cancellation_token,
+        )
+        worker.signals.progress.connect(self._on_extract_progress)
+        worker.signals.finished.connect(self._on_extract_finished)
+        worker.signals.cancelled.connect(self._on_extract_cancelled)
+        worker.signals.error.connect(self._on_extract_error)
+        self.thread_pool.start(worker)
+
+    def _on_extract_progress(self, current: int, total: int, sample_name: str):
+        self.status_progress.setMaximum(total)
+        self.status_progress.setValue(current)
+        self.statusBar().showMessage(f"Extracting ({current}/{total}): {sample_name}")
+
+    def _on_extract_finished(self, result: dict):
+        self._reset_task_ui()
+        chrom_dir = result.get("chrom_dir", "")
+        if chrom_dir:
+            self.csv_folder_edit.setText(chrom_dir)
+            self.plot_folder_edit.setText(chrom_dir)
+            self.labplot_folder_edit.setText(chrom_dir)
+            folder_name = os.path.basename(os.path.normpath(chrom_dir)) or "export"
+            self.labplot_output_edit.setText(os.path.join(chrom_dir, f"Waters_{folder_name}_export.vsz"))
+            self.refresh_plot_files()
+            self.refresh_integration_preview_files()
         self.refresh_raw_preview()
         console_log(f"Extraction finished successfully -> {chrom_dir}", category="UI-EXTRACT")
         QMessageBox.information(
             self,
             "Extraction complete",
-            f"Chromatographic CSV files were written to:\n{chrom_dir}\n\n" +
-            f"m/z and TIC CSVs are in sibling folders:\n" +
+            f"Chromatographic CSV files were written to:\n{chrom_dir}\n\n"
+            f"m/z and TIC CSVs are in sibling folders:\n"
             f"{os.path.dirname(chrom_dir)}"
         )
         self.statusBar().showMessage(f"Extraction complete: {chrom_dir}")
+
+    def _on_extract_cancelled(self):
+        self._reset_task_ui()
+        self.refresh_raw_preview()
+        console_log("Extraction aborted by user.", category="UI-EXTRACT", level="WARN")
+        self.statusBar().showMessage("Extraction aborted")
+        QMessageBox.warning(self, "Extraction Aborted", "The extraction operation was stopped by the user.")
+
+    def _on_extract_error(self, err_msg: str):
+        self._reset_task_ui()
+        self.refresh_raw_preview()
+        console_log(f"Extraction failed: {err_msg}", category="UI-EXTRACT", level="ERROR")
+        QMessageBox.critical(self, "Extraction failed", err_msg)
+        self.statusBar().showMessage("Extraction failed")
 
     def browse_csv_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select chromatogram CSV folder")
         if folder:
             self.csv_folder_edit.setText(folder)
             self.labplot_folder_edit.setText(folder)
-            self.labplot_output_edit.setText(os.path.join(folder, "Waters_LabPlot_Project.lml"))
+            folder_name = os.path.basename(os.path.normpath(folder)) or "export"
+            self.labplot_output_edit.setText(os.path.join(folder, f"Waters_{folder_name}_export.vsz"))
             self.refresh_integration_preview_files()
 
     def add_target(self):
@@ -2795,45 +3824,76 @@ class MassLynxWindow(QMainWindow):
 
         target_summary = ", ".join(f"{c:.3f}m (-{tm:.3f},+{tp:.3f})" for c, tm, tp in self.targets)
         console_log(f"Starting peak integration in: {csv_folder} ({len(files)} CSVs, targets: [{target_summary}])", category="UI-INTEGRATE")
+        self.statusBar().showMessage(f"Starting peak integration (0/{len(files)})...")
 
-        headers = ["Sample"] + [f"{center:.3f} min" for center, _, _ in self.targets]
-        rows = []
-        processed = 0
-        for sample_name, path in files:
-            try:
-                channels = read_chrom_csv_channels(path)
-                if not channels:
-                    raise ValueError("Empty or invalid chromatogram")
-                for channel_name, times, intensities in channels:
-                    areas = [
-                        integrate_peak_asym(times, intensities, center, tol_minus, tol_plus, smooth_win=5)
-                        for center, tol_minus, tol_plus in self.targets
-                    ]
-                    name = sample_name
-                    if len(channels) > 1:
-                        name = f"{sample_name}_{channel_name.replace(' ', '')}"
-                    area_strs = [f"{area:.6g}" for area in areas]
-                    rows.append({"Sample": name, **{header: val for header, val in zip(headers[1:], area_strs)}})
-                    area_log = ", ".join(f"{c:.3f}m={a:.4g}" for (c, _, _), a in zip(self.targets, areas))
-                    console_log(f"Integrated '{name}': {area_log}", category="UI-INTEGRATE")
-                processed += 1
-            except Exception as exc:
-                console_log(f"Integration error for '{sample_name}': {exc}", category="UI-INTEGRATE", level="WARN")
-                rows.append({"Sample": sample_name, **{header: "0" for header in headers[1:]}})
+        # Configure worker & UI controls
+        self.extract_button.setEnabled(False)
+        self.run_integration_button.setEnabled(False)
+        self.status_progress.setRange(0, len(files))
+        self.status_progress.setValue(0)
+        self.status_progress.setVisible(True)
+        self.status_abort_btn.setEnabled(True)
+        self.status_abort_btn.setText("Abort")
+        self.status_abort_btn.setVisible(True)
 
-        output_path = os.path.join(csv_folder, "00_evaluated_data.csv")
-        try:
-            with open(output_path, "w", newline="", encoding="utf-8") as output_file:
-                writer = csv.DictWriter(output_file, fieldnames=headers)
-                writer.writeheader()
-                writer.writerows(rows)
-            console_log(f"Saved evaluation summary to: {output_path} ({len(rows)} sample/channel rows, {len(self.targets)} targets)", category="UI-INTEGRATE")
-        except OSError as exc:
-            console_log(f"Write failed for {output_path}: {exc}", category="UI-INTEGRATE", level="ERROR")
-            QMessageBox.critical(self, "Write failed", str(exc))
-            return
+        self.active_cancellation_token = CancellationToken()
+        worker = IntegrationWorker(
+            csv_folder=csv_folder,
+            files=files,
+            targets=list(self.targets),
+            token=self.active_cancellation_token,
+        )
+        worker.signals.progress.connect(self._on_integrate_progress)
+        worker.signals.finished.connect(self._on_integrate_finished)
+        worker.signals.cancelled.connect(self._on_integrate_cancelled)
+        worker.signals.error.connect(self._on_integrate_error)
+        self.thread_pool.start(worker)
+
+    def _on_integrate_progress(self, current: int, total: int, sample_name: str):
+        self.status_progress.setMaximum(total)
+        self.status_progress.setValue(current)
+        self.statusBar().showMessage(f"Integrating ({current}/{total}): {sample_name}")
+
+    def _on_integrate_finished(self, result: dict):
+        self._reset_task_ui()
+        output_path = result.get("output_path", "")
+        processed = result.get("processed", 0)
+        total = result.get("total", 0)
+        self.refresh_plot_files()
+        self.statusBar().showMessage(f"Integration complete: {processed}/{total} files")
         QMessageBox.information(self, "Integration complete", f"Integrated {processed} file(s).\nSaved to:\n{output_path}")
-        self.statusBar().showMessage(f"Integration complete: {processed}/{len(files)} files")
+
+    def _on_integrate_cancelled(self):
+        self._reset_task_ui()
+        console_log("Peak integration aborted by user.", category="UI-INTEGRATE", level="WARN")
+        self.statusBar().showMessage("Integration aborted")
+        QMessageBox.warning(self, "Integration Aborted", "Peak integration was stopped by the user.")
+
+    def _on_integrate_error(self, err_msg: str):
+        self._reset_task_ui()
+        console_log(f"Integration failed: {err_msg}", category="UI-INTEGRATE", level="ERROR")
+        QMessageBox.critical(self, "Integration failed", err_msg)
+        self.statusBar().showMessage("Integration failed")
+
+    def abort_active_task(self):
+        if self.active_cancellation_token and not self.active_cancellation_token.is_cancelled():
+            self.status_abort_btn.setEnabled(False)
+            self.status_abort_btn.setText("Stopping...")
+            self.statusBar().showMessage("Aborting active operation...")
+            console_log("Cancellation requested by user.", category="SYSTEM", level="WARN")
+            self.active_cancellation_token.cancel()
+
+    def _reset_task_ui(self):
+        self.active_cancellation_token = None
+        self.status_progress.setVisible(False)
+        self.status_progress.setValue(0)
+        self.status_abort_btn.setVisible(False)
+        self.status_abort_btn.setEnabled(True)
+        self.status_abort_btn.setText("Abort")
+        if hasattr(self, "extract_button"):
+            self.extract_button.setEnabled(True)
+        if hasattr(self, "run_integration_button"):
+            self.run_integration_button.setEnabled(True)
 
     def browse_plot_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder with chromatogram CSVs")
@@ -2874,8 +3934,10 @@ class MassLynxWindow(QMainWindow):
     def load_plot_csv(self, *_args):
         selected_rows = self.plot_file_table.selectionModel().selectedRows()
         path = None
+        row_idx = -1
         if selected_rows:
-            item = self.plot_file_table.item(selected_rows[0].row(), 0)
+            row_idx = selected_rows[0].row()
+            item = self.plot_file_table.item(row_idx, 0)
             path = item.data(Qt.ItemDataRole.UserRole) if item else None
         if not path:
             self.plot_dataframe = None
@@ -2886,22 +3948,33 @@ class MassLynxWindow(QMainWindow):
             self.csv_preview_status.setText("Select a CSV file to inspect its rows.")
             self.update_plot()
             return
-        try:
-            frame = pd.read_csv(path)
-        except Exception as exc:
-            console_log(f"Failed reading plot CSV '{path}': {exc}", category="UI-PLOT", level="WARN")
-            self.plot_dataframe = None
-            self.plot_csv_type = "CSV"
-            self.csv_preview_table.clear()
-            self.csv_preview_table.setRowCount(0)
-            self.csv_preview_table.setColumnCount(0)
-            self.csv_preview_status.setText("No table preview available for this file.")
-            self.plot_status_label.setText(f"Could not read CSV: {exc}")
-            self.update_plot()
+
+        self._csv_load_request_id += 1
+        req_id = self._csv_load_request_id
+        file_name = os.path.basename(path)
+        self.plot_status_label.setText(f"Loading '{file_name}'...")
+        self.csv_preview_status.setText(f"Loading '{file_name}' asynchronously...")
+
+        worker = CsvLoaderWorker(path=path, request_id=req_id, row_index=row_idx)
+        worker.signals.finished.connect(self._on_plot_csv_loaded)
+        worker.signals.error.connect(self._on_plot_csv_error)
+        self.thread_pool.start(worker)
+
+    def _on_plot_csv_loaded(self, data: dict):
+        if data.get("request_id") != self._csv_load_request_id:
+            # Discard stale CSV load response from previously selected row
             return
+        frame = data["frame"]
+        path = data["path"]
+        row_idx = data["row_index"]
+
         self.plot_dataframe = frame
-        type_item = self.plot_file_table.item(selected_rows[0].row(), 1)
-        self.plot_csv_type = classify_csv_type(path, frame.columns)
+        type_item = self.plot_file_table.item(row_idx, 1)
+        detected_type = classify_csv_type(path, frame.columns)
+        if detected_type != "CSV" or not type_item or type_item.text() == "CSV":
+            self.plot_csv_type = detected_type
+        else:
+            self.plot_csv_type = type_item.text()
         if type_item is not None:
             type_item.setText(self.plot_csv_type)
         if self.plot_csv_type == "Integrated areas":
@@ -2942,6 +4015,31 @@ class MassLynxWindow(QMainWindow):
             category="UI-PLOT",
         )
         self.populate_csv_preview(frame)
+        self.update_plot()
+
+    def _on_plot_csv_error(self, err_payload: str):
+        parts = err_payload.split(":::path:::")
+        err_msg = parts[0]
+        path = ""
+        req_id = None
+        if len(parts) > 1:
+            subparts = parts[1].split(":::req:::")
+            path = subparts[0]
+            if len(subparts) > 1:
+                try:
+                    req_id = int(subparts[1])
+                except ValueError:
+                    pass
+        if req_id is not None and req_id != self._csv_load_request_id:
+            return
+        console_log(f"Failed reading plot CSV '{path}': {err_msg}", category="UI-PLOT", level="WARN")
+        self.plot_dataframe = None
+        self.plot_csv_type = "CSV"
+        self.csv_preview_table.clear()
+        self.csv_preview_table.setRowCount(0)
+        self.csv_preview_table.setColumnCount(0)
+        self.csv_preview_status.setText("No table preview available for this file.")
+        self.plot_status_label.setText(f"Could not read CSV: {err_msg}")
         self.update_plot()
 
     def populate_csv_preview(self, frame: pd.DataFrame):
@@ -3096,6 +4194,7 @@ class MassLynxWindow(QMainWindow):
         signal_columns = [column for column in frame.columns if column != rt_column]
         selected = signal_columns if self.plot_all_checkbox.isChecked() else [self.plot_signal_combo.currentText()]
         x_values = pd.to_numeric(frame[rt_column], errors="coerce")
+        use_decimation = getattr(self, "perf_mode_checkbox", None) and self.perf_mode_checkbox.isChecked()
         plotted = 0
         for column in selected:
             if column not in signal_columns:
@@ -3103,7 +4202,11 @@ class MassLynxWindow(QMainWindow):
             y_values = pd.to_numeric(frame[column], errors="coerce")
             valid = x_values.notna() & y_values.notna()
             if valid.any():
-                self.axes.plot(x_values[valid], y_values[valid], label=str(column), linewidth=1.5)
+                x_pts = x_values[valid].to_numpy()
+                y_pts = y_values[valid].to_numpy()
+                if use_decimation and len(x_pts) > 10000:
+                    x_pts, y_pts = decimate_trace(x_pts, y_pts, max_points=10000)
+                self.axes.plot(x_pts, y_pts, label=str(column), linewidth=1.5)
                 plotted += 1
         self.axes.set_xlabel(str(rt_column))
         if self.plot_csv_type == "DAD":
@@ -3176,12 +4279,210 @@ class MassLynxWindow(QMainWindow):
         self.figure.savefig(filename, format=extension[1:], bbox_inches="tight", dpi=dpi)
         console_log(f"Plot exported successfully: {filename}", category="UI-EXPORT")
 
+    def _on_perf_mode_toggled(self, checked: bool):
+        self.settings.setValue("plot/perf_mode", checked)
+        console_log(f"Performance mode set to: {'Decimated (Fast)' if checked else 'Raw (High precision)'}", category="UI-PLOT")
+        self.update_plot()
+        if hasattr(self, "integration_preview_panel") and self.integration_preview_panel.isVisible():
+            self.update_integration_preview()
 
-# ---------------------------
-# Run
-# ---------------------------
+    def _on_plot_canvas_hover(self, event):
+        if event.inaxes != self.axes or event.xdata is None or event.ydata is None:
+            return
+        x_val = event.xdata
+        y_val = event.ydata
+        is_mz_scan = self.plot_csv_type == "m/z" and hasattr(self, "plot_mz_axis_combo") and self.plot_mz_axis_combo.currentData() == "mz"
+
+        active_sig = self.plot_signal_combo.currentText().strip() if hasattr(self, "plot_signal_combo") else None
+        exclude = (self._plot_crosshair, self._plot_marker)
+        curve_pts, primary_f = interpolate_axes_fx(self.axes, x_val, exclude_lines=exclude, preferred_label=active_sig)
+
+        fx_desc = ""
+        if primary_f is not None:
+            if len(curve_pts) > 1 and getattr(self, "plot_all_checkbox", None) and self.plot_all_checkbox.isChecked():
+                items = [f"{lbl}={val:.4g}" if lbl else f"{val:.4g}" for lbl, val in curve_pts[:3]]
+                if len(curve_pts) > 3:
+                    items.append(f"+{len(curve_pts)-3} more")
+                fx_desc = f" | f(x): [{', '.join(items)}]"
+            else:
+                unit = " AU" if self.plot_csv_type == "DAD" else ""
+                fx_desc = f" | f(x): {primary_f:.4g}{unit}"
+
+        if is_mz_scan:
+            hud_text = f"m/z: {x_val:.2f} | Cursor: {y_val:.4g}{fx_desc}"
+        else:
+            hud_text = f"RT: {x_val:.3f} min | Cursor: {y_val:.4g}{fx_desc}"
+        if hasattr(self, "plot_hud_label"):
+            self.plot_hud_label.setText(hud_text)
+        self.statusBar().showMessage(f"Cursor: {hud_text}", 1500)
+
+        # Draw / update vertical guideline
+        if self._plot_crosshair is None or self._plot_crosshair not in self.axes.lines:
+            self._plot_crosshair = self.axes.axvline(x_val, color="#64748b", linestyle=":", linewidth=0.9, alpha=0.8)
+        else:
+            self._plot_crosshair.set_xdata([x_val, x_val])
+            self._plot_crosshair.set_visible(True)
+
+        # Draw / update curve tracker marker
+        if primary_f is not None:
+            if self._plot_marker is None or self._plot_marker not in self.axes.lines:
+                self._plot_marker = self.axes.plot([x_val], [primary_f], "o", color="#ef4444", markersize=4.5, zorder=8)[0]
+            else:
+                self._plot_marker.set_data([x_val], [primary_f])
+                self._plot_marker.set_visible(True)
+        elif self._plot_marker is not None and self._plot_marker in self.axes.lines:
+            self._plot_marker.set_visible(False)
+
+        self.plot_canvas.draw_idle()
+
+    def _on_plot_canvas_leave(self, event):
+        if self._plot_crosshair is not None and self._plot_crosshair in self.axes.lines:
+            self._plot_crosshair.set_visible(False)
+        if self._plot_marker is not None and self._plot_marker in self.axes.lines:
+            self._plot_marker.set_visible(False)
+        self.plot_canvas.draw_idle()
+        if hasattr(self, "plot_hud_label"):
+            self.plot_hud_label.setText("RT: -- | Signal: --")
+
+    def _on_plot_canvas_click(self, event):
+        # Retention time picking is exclusive to the integration checker on double-click
+        pass
+
+    def _on_integration_canvas_hover(self, event):
+        if event.inaxes != self.integration_axes or event.xdata is None or event.ydata is None:
+            return
+        x_val = event.xdata
+        y_val = event.ydata
+
+        exclude = (self._integration_crosshair, self._integration_marker)
+        curve_pts, primary_f = interpolate_axes_fx(self.integration_axes, x_val, exclude_lines=exclude)
+
+        fx_desc = ""
+        if primary_f is not None:
+            fx_desc = f" | f(x): {primary_f:.4g}"
+
+        hud_text = f"RT: {x_val:.3f} min | Cursor: {y_val:.4g}{fx_desc}"
+        if hasattr(self, "integration_hud_label"):
+            self.integration_hud_label.setText(hud_text)
+        self.statusBar().showMessage(f"Cursor: {hud_text}", 1500)
+
+        # Draw / update vertical guideline
+        if self._integration_crosshair is None or self._integration_crosshair not in self.integration_axes.lines:
+            self._integration_crosshair = self.integration_axes.axvline(x_val, color="#64748b", linestyle=":", linewidth=0.9, alpha=0.8)
+        else:
+            self._integration_crosshair.set_xdata([x_val, x_val])
+            self._integration_crosshair.set_visible(True)
+
+        # Draw / update curve tracker marker
+        if primary_f is not None:
+            if self._integration_marker is None or self._integration_marker not in self.integration_axes.lines:
+                self._integration_marker = self.integration_axes.plot([x_val], [primary_f], "o", color="#ef4444", markersize=4.5, zorder=8)[0]
+            else:
+                self._integration_marker.set_data([x_val], [primary_f])
+                self._integration_marker.set_visible(True)
+        elif self._integration_marker is not None and self._integration_marker in self.integration_axes.lines:
+            self._integration_marker.set_visible(False)
+
+        self.integration_canvas.draw_idle()
+
+    def _on_integration_canvas_leave(self, event):
+        if self._integration_crosshair is not None and self._integration_crosshair in self.integration_axes.lines:
+            self._integration_crosshair.set_visible(False)
+        if self._integration_marker is not None and self._integration_marker in self.integration_axes.lines:
+            self._integration_marker.set_visible(False)
+        self.integration_canvas.draw_idle()
+        if hasattr(self, "integration_hud_label"):
+            self.integration_hud_label.setText("RT: -- | Signal: --")
+
+    def _on_integration_canvas_click(self, event):
+        if event.button != 1 or event.inaxes != self.integration_axes or event.xdata is None:
+            return
+        if not getattr(event, "dblclick", False):
+            return
+        picked_rt = round(event.xdata, 3)
+        self.center_edit.setText(f"{picked_rt:.3f}")
+        if not self.tol_minus_edit.text().strip():
+            self.tol_minus_edit.setText("0.200")
+        if not self.tol_plus_edit.text().strip():
+            self.tol_plus_edit.setText("0.200")
+        self.statusBar().showMessage(f"Selected RT {picked_rt:.3f} min as target center (Click 'Add target' to save)", 4000)
+        console_log(f"Picked retention time from integration checker: RT={picked_rt:.3f} min", category="TARGETS")
+
+    def export_integration_excel_clicked(self):
+        csv_folder = self.csv_folder_edit.text().strip()
+        eval_csv = os.path.join(csv_folder, "00_evaluated_data.csv")
+        if not os.path.isfile(eval_csv):
+            QMessageBox.warning(
+                self,
+                "No evaluated data",
+                "No '00_evaluated_data.csv' found in the current folder.\nPlease run peak integration first.",
+            )
+            return
+        default_xlsx = os.path.join(csv_folder, "00_evaluated_data.xlsx")
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export peak integration to Excel",
+            default_xlsx,
+            "Excel Workbook (*.xlsx)",
+        )
+        if not output_path:
+            return
+        if not output_path.lower().endswith(".xlsx"):
+            output_path += ".xlsx"
+        try:
+            export_evaluated_to_excel(eval_csv, self.targets, output_path)
+            QMessageBox.information(
+                self,
+                "Excel export complete",
+                f"Peak integration data was exported to Excel successfully:\n\n{output_path}",
+            )
+            self.statusBar().showMessage(f"Excel export complete: {output_path}")
+        except Exception as exc:
+            console_log(f"Excel export failed: {exc}", category="UI-EXPORT", level="ERROR")
+            QMessageBox.critical(self, "Export failed", str(exc))
+
+    def export_plot_table_excel_clicked(self):
+        if self.plot_dataframe is None or self.plot_dataframe.empty:
+            QMessageBox.warning(self, "No data", "No CSV dataset is currently loaded.")
+            return
+        folder = self.plot_folder_edit.text().strip() or os.getcwd()
+        selected_rows = self.plot_file_table.selectionModel().selectedRows()
+        base_name = "export_table.xlsx"
+        if selected_rows:
+            item = self.plot_file_table.item(selected_rows[0].row(), 0)
+            if item:
+                base_name = f"{os.path.splitext(item.text())[0]}.xlsx"
+        default_xlsx = os.path.join(folder, base_name)
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export table to Excel",
+            default_xlsx,
+            "Excel Workbook (*.xlsx)",
+        )
+        if not output_path:
+            return
+        if not output_path.lower().endswith(".xlsx"):
+            output_path += ".xlsx"
+        try:
+            export_evaluated_to_excel(self.plot_dataframe, self.targets, output_path)
+            QMessageBox.information(
+                self,
+                "Excel export complete",
+                f"Dataset exported to Excel successfully:\n\n{output_path}",
+            )
+            self.statusBar().showMessage(f"Excel export complete: {output_path}")
+        except Exception as exc:
+            console_log(f"Excel export failed: {exc}", category="UI-EXPORT", level="ERROR")
+            QMessageBox.critical(self, "Export failed", str(exc))
+
+
+# =============================================================================
+# PART 8: APPLICATION ENTRY POINT & CLI BOOTSTRAP
+# =============================================================================
+
 if __name__ == "__main__":
     qt_app = QApplication(sys.argv)
     window = MassLynxWindow()
     window.show()
     sys.exit(qt_app.exec())
+
