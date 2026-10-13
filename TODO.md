@@ -202,12 +202,12 @@ sequenceDiagram
 - CSV lacks formatting, multiple worksheets, or relational queries.
 
 **Target Architecture:**
-- **Excel Export (`.xlsx` via `openpyxl` or `xlsxwriter`):**
+- **Excel Export (`.xlsx` via `openpyxl`):**
   - Multi-sheet workbook:
-    - Sheet 1: `Integrated Summary` (styled header, frozen rows, zebra stripes, conditional formatting).
-    - Sheet 2: `Target Parameters` (retention time targets, tolerance windows, date run).
-    - Sheet 3: `Sample Metadata` (raw file sources, wavelength channels, extraction timestamps).
-    - Embedded Excel chart: Native bar chart comparing peak areas across samples.
+    - Sheet 1: `Integrated Summary` (styled header, frozen panes, Excel Named Table `IntegratedDataTable`, auto-filters, wavelength-specific conditional cell fills & badges enabling native "Filter by Color", embedded openpyxl bar chart).
+    - Sheet 2: `Substance Mapping` (interactive helper sheet: `SubstanceMappingTable` mapping RT windows to substance IDs like '13' or '203' with roles and response factors, plus `ConversionCalculationTable` computing dynamic conversion %, area ratios P/SM, and total peak areas via live cross-sheet formulas).
+    - Sheet 3: `Target Parameters` (retention time targets, tolerance windows, start/end bounds).
+    - Sheet 4: `Metadata` (software version, run timestamp, target summary, statistics).
 - **Database Export (`.sqlite` / `.duckdb`):**
   - Relational schema:
     - `runs`: Run metadata, instrument, date, root folder.
@@ -217,8 +217,11 @@ sequenceDiagram
   - Enables longitudinal tracking across different experiment batches.
 
 **Task Checklist:**
-- [x] Implement `export_to_excel(evaluated_df, targets, output_path)` with professional styling (multi-sheet workbook, custom headers, auto-fit columns, native openpyxl bar chart).
-- [x] Add Excel export options in Section 02 and Section 03.
+- [x] Implement `export_evaluated_to_excel(evaluated_df, targets, output_path)` with professional styling (multi-sheet workbook, custom headers, auto-fit columns, native openpyxl bar chart).
+- [x] Add Excel Named Tables (`IntegratedDataTable`, `SubstanceMappingTable`, `ConversionCalculationTable`) with native auto-filtering and structured references.
+- [x] Add wavelength-specific pastel conditional formatting and channel badges for native Excel "Filter by Color".
+- [x] Implement dedicated `Substance Mapping` worksheet linking RT windows to substance IDs (e.g. '13', '203') with dynamic cross-sheet formulas for conversion % and area ratios.
+- [x] Add Excel export buttons in Section 02 (Integration Evaluator) and Section 03 (Plot Data Table Previewer).
 - [ ] Create `core/database.py` with SQLite schema creation and insertion routines.
 - [ ] Add "Export to SQLite Database" dialog with option to append to an existing database.
 

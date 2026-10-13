@@ -26,6 +26,7 @@ try:
     from openpyxl.styles import Font as XlsxFont, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
     from openpyxl.chart import BarChart, Reference
+    from openpyxl.worksheet.table import Table, TableStyleInfo
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
@@ -1253,9 +1254,12 @@ def export_evaluated_to_excel(
     """
     Export evaluated chromatographic peak integration data to a formatted Excel workbook (.xlsx).
     Creates a multi-sheet workbook:
-      Sheet 1: 'Integrated Summary' - Styled table with zebra striping and embedded bar chart.
-      Sheet 2: 'Target Parameters' - Retention times, tolerances, and integration windows.
-      Sheet 3: 'Metadata & Diagnostics' - Software version, run timestamp, and statistics.
+      Sheet 1: 'Integrated Summary' - Styled Excel Named Table with wavelength-specific conditional
+               coloring, auto-filter controls, and embedded bar chart.
+      Sheet 2: 'Substance Mapping' - Helper table linking RT windows with substances (e.g., '13', '203')
+               and dynamic formulas for conversion % and area change calculations.
+      Sheet 3: 'Target Parameters' - Retention times, tolerances, and integration windows.
+      Sheet 4: 'Metadata' - Software version, run timestamp, and statistics.
     Requires openpyxl.
     """
     if not HAS_OPENPYXL:
@@ -1268,6 +1272,32 @@ def export_evaluated_to_excel(
         df = pd.read_csv(csv_or_df)
     else:
         df = csv_or_df.copy()
+
+    # If df has 'Sample' and not 'Wavelength', insert extracted Wavelength column
+    has_sample = "Sample" in df.columns
+    if has_sample and "Wavelength" not in df.columns:
+        def _extract_wl(s: str) -> str:
+            m = re.findall(r"(\d{2,4})[\s_]*nm", str(s), re.IGNORECASE)
+            return f"{m[-1]} nm" if m else "General"
+        wls = [_extract_wl(v) for v in df["Sample"]]
+        df.insert(1, "Wavelength", wls)
+
+    # Detect candidate substance identifiers from Sample names
+    cand_subs: List[str] = []
+    if has_sample:
+        for s in df["Sample"]:
+            norm = str(s).replace("\\", "/")
+            parts = norm.split("/")
+            if len(parts) > 1 and parts[0].strip() and parts[0].strip() not in cand_subs:
+                cand_subs.append(parts[0].strip())
+            base = os.path.basename(norm)
+            for num in re.findall(r"(?:^|[_\W])(\d{1,4})(?:[_\W]|$)", base):
+                if len(num) == 4 and (num.startswith("19") or num.startswith("20")):
+                    continue
+                if num in {"210", "214", "220", "230", "240", "254", "260", "270", "280", "290", "300"}:
+                    continue
+                if num not in cand_subs:
+                    cand_subs.append(num)
 
     wb = openpyxl.Workbook()
 
@@ -1284,6 +1314,38 @@ def export_evaluated_to_excel(
     ws1["A2"] = subtitle
     ws1["A2"].font = XlsxFont(name="Calibri", size=10, italic=True, color="555555")
 
+    # Curated palette for wavelength conditional coloring
+    PALETTE_PRESETS = {
+        "210 nm": {"fill": "E0F2FE", "text": "0369A1", "tint": "F0F9FF"},
+        "214 nm": {"fill": "E0E7FF", "text": "3730A3", "tint": "EEF2FF"},
+        "220 nm": {"fill": "EDE9FE", "text": "5B21B6", "tint": "F5F3FF"},
+        "230 nm": {"fill": "F3E8FF", "text": "6B21A8", "tint": "FAF5FF"},
+        "240 nm": {"fill": "DBEAFE", "text": "1E40AF", "tint": "EFF6FF"},
+        "254 nm": {"fill": "D1FAE5", "text": "065F46", "tint": "ECFDF5"},
+        "260 nm": {"fill": "CCFBF1", "text": "0F766E", "tint": "F0FDFA"},
+        "270 nm": {"fill": "FCE7F3", "text": "9D174D", "tint": "FDF2F8"},
+        "280 nm": {"fill": "FEF3C7", "text": "92400E", "tint": "FFFBEB"},
+        "290 nm": {"fill": "FFEDD5", "text": "9A3412", "tint": "FFF7ED"},
+        "300 nm": {"fill": "FEE2E2", "text": "991B1B", "tint": "FEF2F2"},
+    }
+    FALLBACK_CYCLES = [
+        {"fill": "E0F2FE", "text": "0369A1", "tint": "F0F9FF"},
+        {"fill": "FCE7F3", "text": "9D174D", "tint": "FDF2F8"},
+        {"fill": "D1FAE5", "text": "065F46", "tint": "ECFDF5"},
+        {"fill": "FEF3C7", "text": "92400E", "tint": "FFFBEB"},
+        {"fill": "EDE9FE", "text": "5B21B6", "tint": "F5F3FF"},
+        {"fill": "FFEDD5", "text": "9A3412", "tint": "FFF7ED"},
+        {"fill": "CCFBF1", "text": "0F766E", "tint": "F0FDFA"},
+    ]
+
+    unique_wls = list(dict.fromkeys(df["Wavelength"])) if "Wavelength" in df.columns else []
+    wl_colors = {}
+    for idx, wl in enumerate(unique_wls):
+        if wl in PALETTE_PRESETS:
+            wl_colors[wl] = PALETTE_PRESETS[wl]
+        else:
+            wl_colors[wl] = FALLBACK_CYCLES[idx % len(FALLBACK_CYCLES)]
+
     # Table Header (Row 4)
     header_fill = PatternFill(start_color="207567", end_color="207567", fill_type="solid")
     header_font = XlsxFont(name="Calibri", size=11, bold=True, color="FFFFFF")
@@ -1296,9 +1358,7 @@ def export_evaluated_to_excel(
         cell.font = header_font
         cell.alignment = header_align
 
-    # Table Data (Rows 5+)
-    even_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-    odd_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    # Table Data (Rows 5+) with conditional coloring per wavelength
     thin_border = Border(
         left=Side(style="thin", color="E2E8F0"),
         right=Side(style="thin", color="E2E8F0"),
@@ -1307,24 +1367,39 @@ def export_evaluated_to_excel(
     )
 
     for row_idx, row_data in enumerate(df.itertuples(index=False), start=5):
-        fill = even_fill if (row_idx % 2 == 0) else odd_fill
+        wl_val = getattr(row_data, "Wavelength", None) if hasattr(row_data, "Wavelength") else (row_data[1] if len(row_data) > 1 and "Wavelength" in headers else None)
+        colors = wl_colors.get(wl_val, FALLBACK_CYCLES[0]) if wl_val else {"fill": "F1F5F9", "text": "334155", "tint": "F8FAFC"}
+
+        row_fill = PatternFill(start_color=colors["tint"], end_color=colors["tint"], fill_type="solid")
+        wl_badge_fill = PatternFill(start_color=colors["fill"], end_color=colors["fill"], fill_type="solid")
+
         for col_idx, val in enumerate(row_data, start=1):
             cell = ws1.cell(row=row_idx, column=col_idx)
-            if col_idx > 1:
+            header_name = headers[col_idx - 1]
+
+            if header_name == "Wavelength":
+                cell.value = str(val)
+                cell.fill = wl_badge_fill
+                cell.font = XlsxFont(name="Calibri", size=10, bold=True, color=colors["text"])
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif header_name == "Sample":
+                cell.value = str(val)
+                cell.fill = row_fill
+                cell.font = XlsxFont(name="Calibri", size=10)
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+            else:
                 try:
                     num_val = float(val)
                     cell.value = num_val
                     cell.number_format = "0.000000"
-                    cell.alignment = Alignment(horizontal="right")
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
                 except (ValueError, TypeError):
                     cell.value = str(val)
-                    cell.alignment = Alignment(horizontal="left")
-            else:
-                cell.value = str(val)
-                cell.alignment = Alignment(horizontal="left")
-            cell.fill = fill
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                cell.fill = row_fill
+                cell.font = XlsxFont(name="Calibri", size=10)
+
             cell.border = thin_border
-            cell.font = XlsxFont(name="Calibri", size=10)
 
     # Freeze panes below header
     ws1.freeze_panes = "A5"
@@ -1335,34 +1410,192 @@ def export_evaluated_to_excel(
         max_len = max(len(str(col_name)), max((len(str(df.iloc[r, col_idx-1])) for r in range(min(50, len(df)))), default=0))
         ws1.column_dimensions[col_letter].width = max(14, min(40, max_len + 4))
 
+    # Assign an Excel named Table format for filtering & sorting
+    if len(df) > 0:
+        last_col_letter = get_column_letter(len(headers))
+        last_row = 4 + len(df)
+        data_table = Table(displayName="IntegratedDataTable", ref=f"A4:{last_col_letter}{last_row}")
+        data_table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=False, # preserves wavelength conditional colors
+            showColumnStripes=False,
+        )
+        ws1.add_table(data_table)
+
     # Add Bar Chart if data exists
-    if len(df) > 0 and len(headers) > 1:
+    numeric_start_col = 3 if "Wavelength" in headers else 2
+    if len(df) > 0 and len(headers) >= numeric_start_col:
         chart = BarChart()
         chart.type = "col"
         chart.style = 10
         chart.title = "Integrated Peak Areas by Sample"
         chart.y_axis.title = "Area"
         chart.x_axis.title = "Sample"
-        chart.width = 18
+        chart.width = 19
         chart.height = 11
 
-        data_ref = Reference(ws1, min_col=2, min_row=4, max_col=len(headers), max_row=4 + len(df))
+        data_ref = Reference(ws1, min_col=numeric_start_col, min_row=4, max_col=len(headers), max_row=4 + len(df))
         cats_ref = Reference(ws1, min_col=1, min_row=5, max_row=4 + len(df))
         chart.add_data(data_ref, titles_from_data=True)
         chart.set_categories(cats_ref)
         chart_col_letter = get_column_letter(len(headers) + 2)
         ws1.add_chart(chart, f"{chart_col_letter}4")
 
-    # --- Sheet 2: Target Parameters ---
-    ws2 = wb.create_sheet(title="Target Parameters")
+    # --- Sheet 2: Substance Mapping & Conversion Calculations Helper ---
+    ws2 = wb.create_sheet(title="Substance Mapping")
     ws2.views.sheetView[0].showGridLines = True
-    ws2["A1"] = "Integration Target Windows"
-    ws2["A1"].font = XlsxFont(name="Calibri", size=13, bold=True, color="334155")
+
+    ws2["A1"] = "Substance Linking & Conversion Calculator"
+    ws2["A1"].font = XlsxFont(name="Calibri", size=14, bold=True, color="207567")
+
+    ws2["A2"] = "Link RT windows to substances (e.g. '13', '203') to compute conversions, area ratios, and reaction progress."
+    ws2["A2"].font = XlsxFont(name="Calibri", size=10, italic=True, color="555555")
+
+    sub_banner = f"Detected Candidate Substances in Run: {', '.join(cand_subs) if cand_subs else 'None detected automatically'}"
+    ws2["A3"] = sub_banner
+    ws2["A3"].font = XlsxFont(name="Calibri", size=10, bold=True, color="334155")
+
+    # Table 1: Substance Mapping Table
+    ws2["A5"] = "Table 1: Substance & Retention Time Mapping"
+    ws2["A5"].font = XlsxFont(name="Calibri", size=12, bold=True, color="207567")
+
+    map_headers = [
+        "Target #",
+        "RT Window",
+        "Substance ID",
+        "Substance Name / Role",
+        "Expected RT (min)",
+        "Tolerance -",
+        "Tolerance +",
+        "Response Factor (RF)",
+        "Summary Column",
+    ]
+    t1_fill = PatternFill(start_color="207567", end_color="207567", fill_type="solid")
+    for c_idx, h_text in enumerate(map_headers, start=1):
+        c = ws2.cell(row=6, column=c_idx, value=h_text)
+        c.fill = t1_fill
+        c.font = XlsxFont(name="Calibri", size=10, bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    num_targets = len(targets)
+    for t_idx, (center, tol_minus, tol_plus) in enumerate(targets, start=1):
+        r_num = 6 + t_idx
+        assigned_sub = cand_subs[t_idx - 1] if (t_idx - 1) < len(cand_subs) else ""
+        default_role = "Starting Material (SM)" if t_idx == 1 else ("Product" if t_idx == 2 else ("Internal Standard (IS)" if t_idx == 3 else "Byproduct"))
+        col_letter = get_column_letter(2 + t_idx) if "Wavelength" in headers else get_column_letter(1 + t_idx)
+
+        row_vals = [
+            f"Target {t_idx}",
+            f"{center:.3f} min",
+            assigned_sub,
+            default_role,
+            center,
+            tol_minus,
+            tol_plus,
+            1.000,
+            f"'Integrated Summary'!{col_letter}",
+        ]
+        for c_idx, val in enumerate(row_vals, start=1):
+            c = ws2.cell(row=r_num, column=c_idx, value=val)
+            c.border = thin_border
+            c.font = XlsxFont(name="Calibri", size=10)
+            if isinstance(val, (int, float)):
+                c.number_format = "0.000"
+                c.alignment = Alignment(horizontal="right")
+            elif c_idx in (1, 2, 3, 9):
+                c.alignment = Alignment(horizontal="center")
+
+    if num_targets > 0:
+        tab_map = Table(displayName="SubstanceMappingTable", ref=f"A6:I{6 + num_targets}")
+        tab_map.tableStyleInfo = TableStyleInfo(name="TableStyleLight1", showRowStripes=True)
+        ws2.add_table(tab_map)
+
+    # Table 2: Conversion & Area Change Calculations
+    calc_start_row = 8 + max(num_targets, 1)
+    ws2[f"A{calc_start_row}"] = "Table 2: Conversion & Area Change Calculations"
+    ws2[f"A{calc_start_row}"].font = XlsxFont(name="Calibri", size=12, bold=True, color="207567")
+
+    ws2[f"A{calc_start_row + 1}"] = "Formulas reference 'Integrated Summary'. You can change the Reactant or Product columns as needed."
+    ws2[f"A{calc_start_row + 1}"].font = XlsxFont(name="Calibri", size=10, italic=True, color="555555")
+
+    calc_hdr_row = calc_start_row + 2
+    calc_headers = [
+        "Sample",
+        "Wavelength",
+        "Reactant / SM Area",
+        "Product Area",
+        "Conversion (%)",
+        "Area Ratio (P/SM)",
+        "Total Peak Area",
+    ]
+    t2_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    for c_idx, h_text in enumerate(calc_headers, start=1):
+        c = ws2.cell(row=calc_hdr_row, column=c_idx, value=h_text)
+        c.fill = t2_fill
+        c.font = XlsxFont(name="Calibri", size=10, bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    has_target_cols = (len(headers) > (2 if "Wavelength" in headers else 1)) and num_targets > 0
+    reactant_col = "C" if "Wavelength" in headers else "B"
+    product_col = ("D" if num_targets >= 2 else "C") if "Wavelength" in headers else ("C" if num_targets >= 2 else "B")
+    last_target_col = get_column_letter(len(headers))
+
+    for i in range(len(df)):
+        r_calc = calc_hdr_row + 1 + i
+        r_src = 5 + i
+
+        c1 = ws2.cell(row=r_calc, column=1, value=f"='Integrated Summary'!A{r_src}")
+        c2 = ws2.cell(row=r_calc, column=2, value=f"='Integrated Summary'!{'B' if 'Wavelength' in headers else 'A'}{r_src}")
+        if has_target_cols:
+            c3 = ws2.cell(row=r_calc, column=3, value=f"='Integrated Summary'!{reactant_col}{r_src}")
+            c4 = ws2.cell(row=r_calc, column=4, value=f"='Integrated Summary'!{product_col}{r_src}")
+            c5 = ws2.cell(row=r_calc, column=5, value=f"=IF((C{r_calc}+D{r_calc})>0, (D{r_calc}/(C{r_calc}+D{r_calc}))*100, 0)")
+            c6 = ws2.cell(row=r_calc, column=6, value=f"=IF(C{r_calc}>0, D{r_calc}/C{r_calc}, 0)")
+            c7 = ws2.cell(row=r_calc, column=7, value=f"=SUM('Integrated Summary'!{reactant_col}{r_src}:{last_target_col}{r_src})")
+        else:
+            c3 = ws2.cell(row=r_calc, column=3, value=0.0)
+            c4 = ws2.cell(row=r_calc, column=4, value=0.0)
+            c5 = ws2.cell(row=r_calc, column=5, value=0.0)
+            c6 = ws2.cell(row=r_calc, column=6, value=0.0)
+            c7 = ws2.cell(row=r_calc, column=7, value=0.0)
+
+        for c_idx, cell in enumerate((c1, c2, c3, c4, c5, c6, c7), start=1):
+            cell.border = thin_border
+            cell.font = XlsxFont(name="Calibri", size=10)
+            if c_idx in (1, 2):
+                cell.alignment = Alignment(horizontal="left")
+            elif c_idx in (3, 4, 7):
+                cell.number_format = "0.000000"
+                cell.alignment = Alignment(horizontal="right")
+            elif c_idx == 5:
+                cell.number_format = "0.00"
+                cell.alignment = Alignment(horizontal="right")
+            elif c_idx == 6:
+                cell.number_format = "0.0000"
+                cell.alignment = Alignment(horizontal="right")
+
+    if len(df) > 0:
+        tab_calc = Table(displayName="ConversionCalculationTable", ref=f"A{calc_hdr_row}:G{calc_hdr_row + len(df)}")
+        tab_calc.tableStyleInfo = TableStyleInfo(name="TableStyleLight1", showRowStripes=True)
+        ws2.add_table(tab_calc)
+
+    ws2_widths = {1: 30, 2: 18, 3: 20, 4: 24, 5: 18, 6: 18, 7: 18, 8: 20, 9: 24}
+    for c_idx, w in ws2_widths.items():
+        col_letter = get_column_letter(c_idx)
+        ws2.column_dimensions[col_letter].width = w
+
+    # --- Sheet 3: Target Parameters ---
+    ws3 = wb.create_sheet(title="Target Parameters")
+    ws3.views.sheetView[0].showGridLines = True
+    ws3["A1"] = "Integration Target Windows"
+    ws3["A1"].font = XlsxFont(name="Calibri", size=13, bold=True, color="334155")
 
     target_headers = ["Target #", "Center RT (min)", "Tolerance - (min)", "Tolerance + (min)", "Window Start (min)", "Window End (min)"]
     t_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
     for c_idx, h_text in enumerate(target_headers, start=1):
-        c = ws2.cell(row=3, column=c_idx, value=h_text)
+        c = ws3.cell(row=3, column=c_idx, value=h_text)
         c.fill = t_fill
         c.font = XlsxFont(name="Calibri", size=10, bold=True, color="FFFFFF")
         c.alignment = Alignment(horizontal="center")
@@ -1378,22 +1611,22 @@ def export_evaluated_to_excel(
             center + tol_plus,
         ]
         for c_idx, val in enumerate(row_vals, start=1):
-            c = ws2.cell(row=r_num, column=c_idx, value=val)
+            c = ws3.cell(row=r_num, column=c_idx, value=val)
             c.border = thin_border
             c.font = XlsxFont(name="Calibri", size=10)
             if isinstance(val, (int, float)):
                 c.number_format = "0.000"
                 c.alignment = Alignment(horizontal="right")
 
-    for col in ws2.columns:
+    for col in ws3.columns:
         col_letter = get_column_letter(col[0].column)
-        ws2.column_dimensions[col_letter].width = 20
+        ws3.column_dimensions[col_letter].width = 20
 
-    # --- Sheet 3: Metadata & Diagnostics ---
-    ws3 = wb.create_sheet(title="Metadata")
-    ws3.views.sheetView[0].showGridLines = True
-    ws3["A1"] = "Experiment & Export Metadata"
-    ws3["A1"].font = XlsxFont(name="Calibri", size=13, bold=True, color="334155")
+    # --- Sheet 4: Metadata & Diagnostics ---
+    ws4 = wb.create_sheet(title="Metadata")
+    ws4.views.sheetView[0].showGridLines = True
+    ws4["A1"] = "Experiment & Export Metadata"
+    ws4["A1"].font = XlsxFont(name="Calibri", size=13, bold=True, color="334155")
 
     meta_items = [
         ("Application", "Waters MassLynx Integrator"),
@@ -1406,13 +1639,13 @@ def export_evaluated_to_excel(
         meta_items.extend(metadata.items())
 
     for m_idx, (k, v) in enumerate(meta_items, start=3):
-        k_cell = ws3.cell(row=m_idx, column=1, value=str(k))
+        k_cell = ws4.cell(row=m_idx, column=1, value=str(k))
         k_cell.font = XlsxFont(name="Calibri", size=10, bold=True, color="334155")
-        v_cell = ws3.cell(row=m_idx, column=2, value=str(v))
+        v_cell = ws4.cell(row=m_idx, column=2, value=str(v))
         v_cell.font = XlsxFont(name="Calibri", size=10)
 
-    ws3.column_dimensions["A"].width = 24
-    ws3.column_dimensions["B"].width = 60
+    ws4.column_dimensions["A"].width = 24
+    ws4.column_dimensions["B"].width = 60
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     wb.save(output_path)
