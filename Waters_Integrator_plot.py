@@ -4314,7 +4314,6 @@ class MassLynxWindow(QMainWindow):
             hud_text = f"RT: {x_val:.3f} min | Cursor: {y_val:.4g}{fx_desc}"
         if hasattr(self, "plot_hud_label"):
             self.plot_hud_label.setText(hud_text)
-        self.statusBar().showMessage(f"Cursor: {hud_text}", 1500)
 
         # Draw / update vertical guideline
         if self._plot_crosshair is None or self._plot_crosshair not in self.axes.lines:
@@ -4345,8 +4344,33 @@ class MassLynxWindow(QMainWindow):
             self.plot_hud_label.setText("RT: -- | Signal: --")
 
     def _on_plot_canvas_click(self, event):
-        # Retention time picking is exclusive to the integration checker on double-click
-        pass
+        if event.button != 1 or event.inaxes != self.axes or event.xdata is None or event.ydata is None:
+            return
+        x_val = event.xdata
+        y_val = event.ydata
+        is_double = getattr(event, "dblclick", False)
+        click_type = "Double-click" if is_double else "Single-click"
+        is_mz_scan = self.plot_csv_type == "m/z" and hasattr(self, "plot_mz_axis_combo") and self.plot_mz_axis_combo.currentData() == "mz"
+
+        active_sig = self.plot_signal_combo.currentText().strip() if hasattr(self, "plot_signal_combo") else None
+        exclude = (self._plot_crosshair, self._plot_marker)
+        curve_pts, primary_f = interpolate_axes_fx(self.axes, x_val, exclude_lines=exclude, preferred_label=active_sig)
+
+        fx_desc = ""
+        if primary_f is not None:
+            if len(curve_pts) > 1 and getattr(self, "plot_all_checkbox", None) and self.plot_all_checkbox.isChecked():
+                items = [f"{lbl}={val:.4g}" if lbl else f"{val:.4g}" for lbl, val in curve_pts[:3]]
+                if len(curve_pts) > 3:
+                    items.append(f"+{len(curve_pts)-3} more")
+                fx_desc = f" | f(x): [{', '.join(items)}]"
+            else:
+                unit = " AU" if self.plot_csv_type == "DAD" else ""
+                fx_desc = f" | f(x): {primary_f:.4g}{unit}"
+
+        pos_str = f"m/z: {x_val:.2f}" if is_mz_scan else f"RT: {x_val:.3f} min"
+        msg = f"Plot [{click_type}]: {pos_str} | Cursor: {y_val:.4g}{fx_desc}"
+        self.statusBar().showMessage(msg, 4000)
+        console_log(msg, category="PLOT-CURSOR")
 
     def _on_integration_canvas_hover(self, event):
         if event.inaxes != self.integration_axes or event.xdata is None or event.ydata is None:
@@ -4364,7 +4388,6 @@ class MassLynxWindow(QMainWindow):
         hud_text = f"RT: {x_val:.3f} min | Cursor: {y_val:.4g}{fx_desc}"
         if hasattr(self, "integration_hud_label"):
             self.integration_hud_label.setText(hud_text)
-        self.statusBar().showMessage(f"Cursor: {hud_text}", 1500)
 
         # Draw / update vertical guideline
         if self._integration_crosshair is None or self._integration_crosshair not in self.integration_axes.lines:
@@ -4395,18 +4418,31 @@ class MassLynxWindow(QMainWindow):
             self.integration_hud_label.setText("RT: -- | Signal: --")
 
     def _on_integration_canvas_click(self, event):
-        if event.button != 1 or event.inaxes != self.integration_axes or event.xdata is None:
+        if event.button != 1 or event.inaxes != self.integration_axes or event.xdata is None or event.ydata is None:
             return
-        if not getattr(event, "dblclick", False):
-            return
-        picked_rt = round(event.xdata, 3)
-        self.center_edit.setText(f"{picked_rt:.3f}")
-        if not self.tol_minus_edit.text().strip():
-            self.tol_minus_edit.setText("0.200")
-        if not self.tol_plus_edit.text().strip():
-            self.tol_plus_edit.setText("0.200")
-        self.statusBar().showMessage(f"Selected RT {picked_rt:.3f} min as target center (Click 'Add target' to save)", 4000)
-        console_log(f"Picked retention time from integration checker: RT={picked_rt:.3f} min", category="TARGETS")
+        x_val = event.xdata
+        y_val = event.ydata
+        is_double = getattr(event, "dblclick", False)
+
+        exclude = (self._integration_crosshair, self._integration_marker)
+        curve_pts, primary_f = interpolate_axes_fx(self.integration_axes, x_val, exclude_lines=exclude)
+        fx_desc = f" | f(x): {primary_f:.4g}" if primary_f is not None else ""
+
+        if is_double:
+            picked_rt = round(x_val, 3)
+            self.center_edit.setText(f"{picked_rt:.3f}")
+            if not self.tol_minus_edit.text().strip():
+                self.tol_minus_edit.setText("0.200")
+            if not self.tol_plus_edit.text().strip():
+                self.tol_plus_edit.setText("0.200")
+            status_msg = f"Integration [Double-click]: Selected RT {picked_rt:.3f} min as target center{fx_desc} (Click 'Add target' to save)"
+            log_msg = f"Integration [Double-click]: Selected RT {picked_rt:.3f} min as target center | Cursor: {y_val:.4g}{fx_desc}"
+            self.statusBar().showMessage(status_msg, 4000)
+            console_log(log_msg, category="TARGETS")
+        else:
+            msg = f"Integration [Single-click]: RT: {x_val:.3f} min | Cursor: {y_val:.4g}{fx_desc}"
+            self.statusBar().showMessage(msg, 4000)
+            console_log(msg, category="PLOT-CURSOR")
 
     def export_integration_excel_clicked(self):
         csv_folder = self.csv_folder_edit.text().strip()
